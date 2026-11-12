@@ -53,7 +53,27 @@ function DKEOperator(field::Field, pitchgrid::UniformPitchAngleGrid, speedgrid::
 end
 
 _convert_maxwellian(::Type{T}, s::LocalMaxwellian) where {T} =
-    LocalMaxwellian{T}(s.species, T(s.temperature), T(s.density), T(s.dTdrho), T(s.dndrho), T(s.v_thermal))
+    LocalMaxwellian{T}(_convert_species(T, T, s.species), T(s.temperature), T(s.density), T(s.dTdrho), T(s.dndrho), T(s.v_thermal))
+
+"""
+    map_parameters(f, S, op)
+
+`DKEOperator{S}` with `f` applied to every number of `op` that depends on the plasma
+profiles; the field, the grids and the stencils are shared with `op`. With
+`f = ForwardDiff.value` this is the operator at the values of an operator of dual numbers.
+"""
+function map_parameters(f, ::Type{S}, op::DKEOperator) where {S}
+    m(a::AbstractArray) = S[f(v) for v in a]
+    sp(s::LocalMaxwellian) = LocalMaxwellian{S}(_convert_species(f, S, s.species), f(s.temperature), f(s.density), f(s.dTdrho),
+        f(s.dndrho), f(s.v_thermal))
+    tr, c = op.trajectories, op.collisions
+    return DKEOperator{S}(op.field, op.pitchgrid, op.speedgrid, LocalMaxwellian{S}[sp(s) for s in op.species],
+        LocalMaxwellian{S}[sp(s) for s in op.background], f(op.Erho), op.weights,
+        Trajectories{S}(m(tr.wt), m(tr.wz), m(tr.wa), m(tr.wx), tr.has_speed, tr.Dt, tr.Dz, tr.Da, tr.Dx),
+        CollisionOperator{S}(c.nL, c.weights, m(c.nus), c.D, m(c.CE), m(c.CD), m(c.GH), c.Txi, c.Txi_inv, m(c.exchange),
+            m(c.Klocal), m(c.KGH), m(c.Kexchange)),
+        op.surface_weights)
+end
 
 "Dimensions `(nalpha, ntheta, nzeta, nx, nspecies)` of the state."
 state_size(op::DKEOperator) =

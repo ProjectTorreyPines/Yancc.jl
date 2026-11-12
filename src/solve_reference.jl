@@ -27,7 +27,7 @@ with the cube of the number of unknowns; intended for verification.
 function solve_dke_reference(op::DKEOperator{T}; EparB::Real=0.0) where {T}
     border = DKEBorder(op)
     K = bordered_matrix(op, border)
-    b = zeros(T, system_size(op))
+    b = zeros(promote_type(T, typeof(float(EparB))), system_size(op))
     b[1:prod(state_size(op))] .= vec(dke_rhs(op, EparB))
     return DKESolution(op, K \ b)
 end

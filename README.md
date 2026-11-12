@@ -53,7 +53,8 @@ If you use Yancc.jl, please cite the paper that introduced the method:
 | Solver for axisymmetric fields | yes (`solve_dke_tokamak`), specific to Yancc.jl, see below |
 | GCROT Krylov solver with geometric multigrid, for stellarators | not yet |
 | Monoenergetic equation and transport coefficients | not yet |
-| Ambipolar electric field, automatic differentiation, GPU | not yet |
+| Automatic differentiation | forward mode with ForwardDiff, with respect to the plasma profiles, see below |
+| Ambipolar electric field, GPU | not yet |
 
 ## Example
 
@@ -161,6 +162,44 @@ flow, which collisions determine only through small differences, is 4 % off at
 ν* = 10² with `nx = 6` and 0.1 % off with `nx = 10`. Beyond ν* ≈ 10³ the system is too
 ill conditioned for double precision; `solve_dke_tokamak` warns when rounding stops
 the residual above 10⁻⁶. Both are properties of the discretization, not of the solver.
+
+## Automatic differentiation
+
+With ForwardDiff loaded, the species, `Erho` and `EparB` may be dual numbers, and the
+fluxes, flows and bootstrap current carry the derivatives. Continuing the example:
+
+```julia
+using ForwardDiff
+
+function ion_heat_flux(aLT)
+    species = [
+        from_scale_lengths(Deuterium, 2e3, 4.0e19, aLT, 1.0),
+        from_scale_lengths(Carbon, 2e3, 0.17e19, aLT, 1.0),
+        from_scale_lengths(Electron, 2e3, 5.0e19, 3.0, 1.0)
+    ]
+    op = DKEOperator(field, UniformPitchAngleGrid(65), MaxwellSpeedGrid(6), species; p1="4z")
+    return solve_dke_tokamak(op).heat_flux[1]
+end
+
+ForwardDiff.derivative(ion_heat_flux, 3.0)
+```
+
+`solve_dke_tokamak` differentiates the solution implicitly: the kinetic equation is
+solved once in plain numbers, and each direction of differentiation then costs one linear
+solve with the same operator and preconditioner, to the tolerance `tangent_rtol`. With a
+`TokamakCache`, `solve_dke_tokamak!` keeps the directions solved at the current plasma, so
+that the successive chunks of a ForwardDiff Jacobian cost one solve for each dimension of
+the space their directions span, e.g. six for the value and the gradient of three
+profiles, however many unknowns of a transport solver these depend on.
+
+For four species at 6 × 65 × 41 such a Jacobian takes about 2 s on one core and is accurate
+to 10⁻⁴ to 10⁻³ of its largest entries. Finite differences through the cache cost about
+1.5 s for every eight columns and are accurate to 10⁻³ for the ion energy flux and 10⁻¹ for
+the electron particle flux.
+
+The dense solver `solve_dke_reference` works with dual numbers as it is. The charge of a
+species may be a dual number too, as for an average charge state that depends on the
+temperature. The field is plain numbers, and reverse mode is not implemented.
 
 ## Use in FUSE
 

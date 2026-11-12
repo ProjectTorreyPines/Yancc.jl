@@ -9,4 +9,5 @@ include(joinpath(@__DIR__, "golden", "layout.jl"))
     include("test_collisions.jl")
     include("test_dke.jl")
     include("test_tokamak.jl")
+    include("test_ad.jl")
 end

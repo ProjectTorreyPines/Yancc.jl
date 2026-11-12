@@ -252,7 +252,7 @@ function apply_collisions!(out::AbstractArray{<:Any,5}, C::CollisionOperator, f:
 
     # Rosenbluth potential part, diagonal in Legendre mode
     Fm = reshape(C.Txi_inv * G, C.nL, nr, n)
-    Y = similar(Fm)
+    Y = similar(Fm, eltype(out))
     @inbounds for l in 1:C.nL
         @views mul!(Y[l, :, :], Fm[l, :, :], transpose(C.KGH[:, :, l]))
     end
