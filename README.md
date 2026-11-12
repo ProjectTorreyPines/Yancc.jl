@@ -1,3 +1,6 @@
+[![CI](https://github.com/ProjectTorreyPines/Yancc.jl/actions/workflows/runtests.yml/badge.svg?branch=master)](https://github.com/ProjectTorreyPines/Yancc.jl/actions/workflows/runtests.yml)
+[![codecov](https://codecov.io/github/ProjectTorreyPines/Yancc.jl/graph/badge.svg)](https://codecov.io/github/ProjectTorreyPines/Yancc.jl)
+
 # Yancc.jl
 
 Yancc.jl is a Julia port of [**yancc**](https://github.com/f0uriest/yancc) ("Yet Another
@@ -15,28 +18,7 @@ so that the model can be used inside the transport loop of
 it is the one to use for stellarators, on GPUs, and for anything not listed as ported
 below.
 
-## Citing
-
-If you use Yancc.jl, please cite the paper that introduced the method:
-
-> R. Conlin and M. Landreman, "yancc: a GPU-accelerated, differentiable solver for
-> neoclassical transport in tokamaks and stellarators",
-> *Plasma Phys. Control. Fusion* **68**, 115001 (2026).
-> [doi:10.1088/1361-6587/aeb628](https://doi.org/10.1088/1361-6587/aeb628)
-
-```bibtex
-@article{Conlin2026yancc,
-  author  = {Conlin, Rory and Landreman, Matt},
-  title   = {yancc: a {GPU}-accelerated, differentiable solver for neoclassical
-             transport in tokamaks and stellarators},
-  journal = {Plasma Physics and Controlled Fusion},
-  volume  = {68},
-  number  = {11},
-  pages   = {115001},
-  year    = {2026},
-  doi     = {10.1088/1361-6587/aeb628}
-}
-```
+If you use Yancc.jl, please cite their paper, see [Citation](#citation).
 
 ## What is ported
 
@@ -213,3 +195,26 @@ converged values at mid radius and 11 % above in the collisionless core, where
 ## License
 
 MIT, see `LICENSE`, which retains the copyright notice of yancc, and `NOTICE.md`.
+
+## Citation
+
+If you use Yancc.jl, please cite the paper that introduced the method:
+
+> R. Conlin and M. Landreman, "yancc: a GPU-accelerated, differentiable solver for
+> neoclassical transport in tokamaks and stellarators",
+> *Plasma Phys. Control. Fusion* **68**, 115001 (2026).
+> [doi:10.1088/1361-6587/aeb628](https://doi.org/10.1088/1361-6587/aeb628)
+
+```bibtex
+@article{Conlin2026yancc,
+  author  = {Conlin, Rory and Landreman, Matt},
+  title   = {yancc: a {GPU}-accelerated, differentiable solver for neoclassical
+             transport in tokamaks and stellarators},
+  journal = {Plasma Physics and Controlled Fusion},
+  volume  = {68},
+  number  = {11},
+  pages   = {115001},
+  year    = {2026},
+  doi     = {10.1088/1361-6587/aeb628}
+}
+```
