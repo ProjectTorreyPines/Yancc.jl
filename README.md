@@ -12,7 +12,7 @@ so that the model can be used inside the transport loop of
 [FUSE](https://github.com/ProjectTorreyPines/FUSE.jl). The original code
 ([repository](https://github.com/f0uriest/yancc),
 [documentation](https://yancc.readthedocs.io/)) remains the reference implementation:
-it is the one to use for stellarators, on GPUs, and for anything not listed as ported
+it is the one to use for stellarators, for differentiation, and for anything not listed as ported
 below.
 
 ## Citing
@@ -53,7 +53,8 @@ If you use Yancc.jl, please cite the paper that introduced the method:
 | Solver for axisymmetric fields | yes (`solve_dke_tokamak`), specific to Yancc.jl, see below |
 | GCROT Krylov solver with geometric multigrid, for stellarators | not yet |
 | Monoenergetic equation and transport coefficients | not yet |
-| Ambipolar electric field, automatic differentiation, GPU | not yet |
+| GPU | batches of tokamak solves (`solve_dke_tokamak_batch`), specific to Yancc.jl, see below |
+| Ambipolar electric field, automatic differentiation | not yet |
 
 ## Example
 
@@ -161,6 +162,53 @@ flow, which collisions determine only through small differences, is 4 % off at
 ν* = 10² with `nx = 6` and 0.1 % off with `nx = 10`. Beyond ν* ≈ 10³ the system is too
 ill conditioned for double precision; `solve_dke_tokamak` warns when rounding stops
 the residual above 10⁻⁶. Both are properties of the discretization, not of the solver.
+
+## Many solves at once, on a GPU
+
+`solve_dke_tokamak_batch` solves many flux surfaces or scan points together, as needed
+for profiles and for databases:
+
+```julia
+using Yancc, CUDA, CUDSS          # without CUDA and CUDSS: device = :cpu
+
+ops = [DKEOperator(field, UniformPitchAngleGrid(65), MaxwellSpeedGrid(6), species; p1="4z")
+       for (field, species) in cases]
+sols = solve_dke_tokamak_batch(ops; device=:cuda)    # one DKESolution per case
+```
+
+The cases must share the grids, the stencils and the options of the operator; the
+field, the plasma and the electric field may differ. The method is that of
+`solve_dke_tokamak`, with all cases iterated together and the matrices of the
+preconditioner built, factored and solved as batches on the device: the coarse
+matrices, and the plane matrices from 6000 unknowns (`nalpha × ntheta`) up, by a dense
+block elimination in batched cuBLAS kernels, smaller plane matrices by cuDSS, which is
+faster for them. The operators and the fluxes are computed on the host, on all Julia
+threads. Cases are solved in pieces that fit in the memory of the device (4 to 6 kB per
+unknown and case; `batchsize` sets the size), and a case whose batched factorization
+fails is solved again on the host.
+
+CUDA.jl and CUDSS.jl are weak dependencies: they are loaded only when the user loads
+them, and only NVIDIA GPUs are supported. A solve on its own does not gain from a GPU,
+and on the host one `solve_dke_tokamak` per process and core is faster than
+`device = :cpu`, which is there for testing.
+
+Solves per second for D + C + e with `nx = 6`, to `rtol = 1e-6`, on a Perlmutter GPU
+node (four A100 with 40 GB, one process per GPU) and on a CPU node (two EPYC 7763, one
+single threaded process per core, 128 in all):
+
+| `nalpha` × `ntheta` | unknowns | one A100 | four A100 | CPU node |
+|---|---|---|---|---|
+| 65 × 41 | 48 000 | 100 | 393 | 69 |
+| 257 × 61 | 282 000 | 10.0 | 40 | 17 |
+
+(1024 and 128 cases per GPU; the cases differ in aspect ratio, safety factor, density,
+temperature and radial electric field and take 6 to 7 iterations each.) The GPU numbers
+leave out the construction of the operators on the host, which takes 1.4 s for 1024
+cases on 32 threads and lowers the first row to about 88 per GPU. Between the two rows
+the plane matrices change from cuDSS to blocks; with cuDSS the second row would be 5.9
+solves per second on one A100.
+`benchmark/batch_throughput.jl` and `benchmark/single_throughput.jl` reproduce the
+table; the GPU tests run with `YANCC_TEST_GPU=1`.
 
 ## Use in FUSE
 
