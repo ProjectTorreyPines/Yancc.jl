@@ -139,31 +139,40 @@ end
     end
 end
 
-@testset "plane matrices by dense blocks: $p1, nalpha = $nalpha" for p1 in ("4z", "4d"), nalpha in (17, 16, 5)
+@testset "plane matrices by dense blocks: $p1, nalpha = $nalpha, $points pitch angles a block" for p1 in ("4z", "4d"),
+    nalpha in (17, 16, 5), points in (1, 2)
+
     ops = batch_cases(; p1, nalpha, Erho=(0.0, 800.0, -1500.0, 300.0))
     borders = [Yancc.DKEBorder(op) for op in ops]
     bop = Yancc.BatchedDKE(ops, borders, Val(:cpu))
-    layout = Yancc._plane_block_layout(ops[1])
     na, nt = nalpha, 11
-    h = layout.sb ÷ nt   # pitch angles per block: the reach of the α stencils
-    @test layout.sb == h * nt && h == (p1 == "4z" ? 2 : h) && h >= 2
-    @test layout.K == nalpha ÷ h && layout.nbd == (nalpha % h) * nt
-    sparse_maps = Yancc.PreconditionerMaps(ops[1], 4, bop.has_speed, Val(:cpu))
-    block_maps = Yancc.PreconditionerMaps(ops[1], 4, bop.has_speed, Val(:cpu); plane_solver=:block)
-    @test block_maps.planes isa Yancc.PlaneBlockMap
-    planes = Yancc._assemble_preconditioner(sparse_maps, bop)[1]
-    blocks = Yancc._assemble_preconditioner(block_maps, bop)[1]
-    R = reduce(hcat, [test_vector(planes.m) .* k .+ 0.3 for k in 1:length(planes)])
-    X = Yancc._solve_batch!(similar(R), Yancc._factor_batch(Val(:cpu), planes), R)
-    Xb = Yancc._solve_batch!(similar(R), Yancc._factor_planes(Val(:cpu), blocks), R)
-    @test maximum(norm(Xb[:, k] - X[:, k]) / norm(X[:, k]) for k in axes(R, 2)) < 1e-10
-    # the whole solve with either plane solver (and the coarse solver of a GPU)
-    a = first(Yancc._solve_dke_tokamak_batch(ops; rtol=1e-10, coarse_solver=:block))
-    b, status, _ = Yancc._solve_dke_tokamak_batch(ops; rtol=1e-10, plane_solver=:block, coarse_solver=:block)
-    # (the residual stops anywhere up to rtol, so rounding can move a case across it)
-    @test all(==(:converged), status)
-    @test all(abs(b[k].iterations - a[k].iterations) <= 2 for k in eachindex(ops))
-    @test all(isapprox(a[k].heat_flux, b[k].heat_flux; rtol=1e-7) for k in eachindex(ops))
+    h = Yancc._plane_block_layout(ops[1]; points=100).sb ÷ nt   # the reach of the α stencils
+    @test h == (p1 == "4z" ? 2 : h) && h >= 2
+    layout = Yancc._plane_block_layout(ops[1]; points)
+    @test layout.sb == points * nt && layout.w == cld(h, points)
+    @test layout.K == nalpha ÷ points && layout.nbd == (nalpha % points) * nt
+    default = Yancc.PLANE_BLOCK_POINTS[]
+    Yancc.PLANE_BLOCK_POINTS[] = points
+    try
+        sparse_maps = Yancc.PreconditionerMaps(ops[1], 4, bop.has_speed, Val(:cpu))
+        block_maps = Yancc.PreconditionerMaps(ops[1], 4, bop.has_speed, Val(:cpu); plane_solver=:block)
+        @test block_maps.planes isa Yancc.PlaneBlockMap && block_maps.planes.blocks.w == layout.w
+        planes = Yancc._assemble_preconditioner(sparse_maps, bop)[1]
+        blocks = Yancc._assemble_preconditioner(block_maps, bop)[1]
+        R = reduce(hcat, [test_vector(planes.m) .* k .+ 0.3 for k in 1:length(planes)])
+        X = Yancc._solve_batch!(similar(R), Yancc._factor_batch(Val(:cpu), planes), R)
+        Xb = Yancc._solve_batch!(similar(R), Yancc._factor_planes(Val(:cpu), blocks), R)
+        @test maximum(norm(Xb[:, k] - X[:, k]) / norm(X[:, k]) for k in axes(R, 2)) < 1e-10
+        # the whole solve with either plane solver (and the coarse solver of a GPU)
+        a = first(Yancc._solve_dke_tokamak_batch(ops; rtol=1e-10, coarse_solver=:block))
+        b, status, _ = Yancc._solve_dke_tokamak_batch(ops; rtol=1e-10, plane_solver=:block, coarse_solver=:block)
+        # (the residual stops anywhere up to rtol, so rounding can move a case across it)
+        @test all(==(:converged), status)
+        @test all(abs(b[k].iterations - a[k].iterations) <= 2 for k in eachindex(ops))
+        @test all(isapprox(a[k].heat_flux, b[k].heat_flux; rtol=1e-7) for k in eachindex(ops))
+    finally
+        Yancc.PLANE_BLOCK_POINTS[] = default
+    end
 end
 
 @testset "batched solve: contract" begin

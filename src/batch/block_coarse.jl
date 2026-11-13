@@ -4,30 +4,33 @@
 # The coarse unknowns are ordered by poloidal point, `nl n` of them at each, followed by
 # the surface averages and the sources. Poloidal points are coupled through the
 # advection stencil only, which reaches `h` points either way, around the torus. Taking
-# `h` consecutive points as one block of size `sb = h nl n`, and moving the last points
+# `p` consecutive points as one block of size `sb = p nl n`, and moving the last points
 # (at least `h`, so that the rest is a whole number `K` of blocks) to the end with the
 # averages and sources, gives
 #
-#     [ T  U ] [x]   [f]        T: block tridiagonal, K blocks of size sb
-#     [ V  S ] [y] = [g]        S: border of size nbd
+#     [ T  U ] [x]   [f]        T: block banded, K blocks of size sb, w = ⌈h/p⌉
+#     [ V  S ] [y] = [g]           blocks either side of the diagonal
+#                                S: border of size nbd
 #
 # which is solved by block elimination along T and the Schur complement of the border:
 # `K` inverses of `sb × sb` matrices and products with them, each done for all cases of
-# the batch at once. Pivoting is within the blocks.
+# the batch at once. Pivoting is within the blocks. The coarse matrices take `p = h`
+# (block tridiagonal, w = 1).
 #
 # A sparse LU does the same work with less memory traffic on a host; on a GPU the
 # batched dense kernels are several times faster than a batched sparse factorization,
 # and more accurate than one without pivoting.
 
 # `npoints` grid points of `mb` unknowns each, coupled `reach` points either way (around
-# the end when `periodic`), and `extra` unknowns at the end: chain blocks of `reach`
+# the end when `periodic`), and `extra` unknowns at the end: chain blocks of `points`
 # points and a border with the rest. Without periodicity the border may be empty.
-function _chain_layout(reach::Integer, npoints::Integer, mb::Integer, extra::Integer; periodic::Bool)
+function _chain_layout(reach::Integer, npoints::Integer, mb::Integer, extra::Integer; periodic::Bool, points::Integer=reach)
     reach = max(reach, 1)
-    tail = periodic ? reach + npoints % reach : npoints % reach   # points in the border
-    K = (npoints - tail) ÷ reach
+    p = clamp(points, 1, reach)
+    tail = periodic ? reach + (npoints - reach) % p : npoints % p   # points in the border
+    K = (npoints - tail) ÷ p
     K >= 1 || return nothing
-    return (sb=reach * mb, K=K, nbd=tail * mb + extra)
+    return (sb=p * mb, K=K, nbd=tail * mb + extra, w=cld(reach, p))
 end
 
 # largest distance between coupled points of the stencils `sts` on `n` points, around
@@ -52,18 +55,20 @@ end
 Maps from the ingredients of a case to the dense blocks of its coarse matrix: for each
 part (`D`, `L`, `U` of the chain, the border columns `Ub` and rows `Vb`, the border
 `S`), `G` gives the stored entries from the ingredients, which go to position `inblock`
-of block `block` (from 0) of that part.
+of block `block` (from 0) of that part. Block `k + K (d - 1)` of `L` is `T[k, k - d]`,
+of `U` it is `T[k, k + d]`.
 """
 struct BlockAssemblyMap{P<:NamedTuple}
     sb::Int
     K::Int
     nbd::Int
+    w::Int
     ningredients::Int
     parts::P   # name => (G, inblock, block)
 end
 
 function BlockAssemblyMap(e::EntryList, m::Integer, ningredients::Integer, layout::NamedTuple, device::Val)
-    sb, K, nbd = layout.sb, layout.K, layout.nbd
+    sb, K, nbd, w = layout.sb, layout.K, layout.nbd, layout.w
     nch = K * sb
     @assert nch + nbd == m
     names = (:D, :L, :U, :Ub, :Vb, :S)
@@ -73,9 +78,10 @@ function BlockAssemblyMap(e::EntryList, m::Integer, ningredients::Integer, layou
     for (q, (r, c)) in enumerate(zip(e.rows, e.cols))
         if r <= nch && c <= nch
             kr, ir, kc, ic = (r - 1) ÷ sb + 1, (r - 1) % sb + 1, (c - 1) ÷ sb + 1, (c - 1) % sb + 1
-            name = kc == kr ? :D : kc == kr - 1 ? :L : kc == kr + 1 ? :U :
-                   error("coarse matrix: an entry couples blocks $kr and $kc, which are not neighbours")
-            slot = ir + sb * (ic - 1) + sb * sb * (kr - 1)
+            d = kr - kc
+            abs(d) <= w || error("block matrix: an entry couples blocks $kr and $kc, more than $w apart")
+            name = d == 0 ? :D : d > 0 ? :L : :U
+            slot = ir + sb * (ic - 1) + sb * sb * (kr - 1 + K * (max(abs(d), 1) - 1))
         elseif r <= nch
             name, slot = :Ub, (r - 1) % sb + 1 + sb * (c - nch - 1) + sb * nbd * ((r - 1) ÷ sb)
         elseif c <= nch
@@ -92,7 +98,7 @@ function BlockAssemblyMap(e::EntryList, m::Integer, ningredients::Integer, layou
         n = blocksize[name]
         (G=_to_device(device, G), inblock=_to_device(device, (stored .- 1) .% n .+ 1), block=_to_device(device, (stored .- 1) .÷ n))
     end
-    return BlockAssemblyMap(sb, K, nbd, Int(ningredients), NamedTuple{names}(parts))
+    return BlockAssemblyMap(sb, K, nbd, w, Int(ningredients), NamedTuple{names}(parts))
 end
 
 # `nblocks` blocks of size `rows × cols` of all cases, [:, :, case, block], zero but for
@@ -109,10 +115,11 @@ end
 
 # the blocks of all cases, [:, :, case, block]
 function _assemble_blocks(map::BlockAssemblyMap, Θ::AbstractMatrix)
-    sb, K, nbd, B = map.sb, map.K, map.nbd, size(Θ, 2)
+    sb, K, nbd, w, B = map.sb, map.K, map.nbd, map.w, size(Θ, 2)
     p = map.parts
-    return (sb=sb, K=K, nbd=nbd, D=_scatter(p.D, Θ, sb, sb, K), L=_scatter(p.L, Θ, sb, sb, K), U=_scatter(p.U, Θ, sb, sb, K),
-        Ub=_scatter(p.Ub, Θ, sb, nbd, K), Vb=_scatter(p.Vb, Θ, nbd, sb, K), S=reshape(_scatter(p.S, Θ, nbd, nbd, 1), nbd, nbd, B))
+    return (sb=sb, K=K, nbd=nbd, w=w, D=_scatter(p.D, Θ, sb, sb, K), L=_scatter(p.L, Θ, sb, sb, K * w),
+        U=_scatter(p.U, Θ, sb, sb, K * w), Ub=_scatter(p.Ub, Θ, sb, nbd, K), Vb=_scatter(p.Vb, Θ, nbd, sb, K),
+        S=reshape(_scatter(p.S, Θ, nbd, nbd, 1), nbd, nbd, B))
 end
 
 """
@@ -131,9 +138,10 @@ struct BlockCoarseFactors{A4,A3,W<:NamedTuple}
     sb::Int
     K::Int
     nbd::Int
+    w::Int
     Dinv::A4   # inverse of the pivot blocks of T, [:, :, case, block]
-    Lhat::A4   # lower blocks times the inverse of the pivot above
-    U::A4      # upper blocks
+    Lhat::A4   # lower blocks times the inverse of the pivot of their column
+    U::A4      # upper blocks after the elimination
     Y::A4      # T⁻¹ U of the border columns
     V::A4      # border rows
     Sinv::A3   # inverse of the Schur complement of the border
@@ -141,71 +149,77 @@ struct BlockCoarseFactors{A4,A3,W<:NamedTuple}
 end
 
 _slice(A::AbstractArray{<:Any,4}, k::Integer) = view(A, :, :, :, k)
+# block T[k, k - d] (lower) or T[k, k + d] (upper) of the band, d ≥ 1
+_band(A::AbstractArray{<:Any,4}, K::Integer, k::Integer, d::Integer) = view(A, :, :, :, k + K * (d - 1))
+
+# block T[i, j] of the band
+_block(D, L, U, K, i, j) = i == j ? _slice(D, i) : i > j ? _band(L, K, i, i - j) : _band(U, K, i, j - i)
 
 "Factorization of the coarse matrices given by their blocks, which are overwritten."
 function _factor_blocks(b::NamedTuple)
-    sb, K, nbd, B = b.sb, b.K, b.nbd, size(b.S, 3)
+    sb, K, nbd, w, B = b.sb, b.K, b.nbd, b.w, size(b.S, 3)
     D, L, U, Y, V, S = b.D, b.L, b.U, b.Ub, b.Vb, b.S
-    # the inverses of the pivots replace D, and L D⁻¹ replaces L, block by block
+    # the inverses of the pivots replace D, and T[i, k] D⁻¹ replaces T[i, k], block by block
     Dinv, Lhat = D, L
     tmp = similar(D, sb, sb, B)
-    _batched_inverse!(tmp, _slice(D, 1))
-    _slice(Dinv, 1) .= tmp
-    for k in 2:K
-        _batched_gemm!('N', 'N', 1.0, _slice(L, k), _slice(Dinv, k - 1), 0.0, tmp)
-        _slice(Lhat, k) .= tmp
-        _batched_gemm!('N', 'N', -1.0, _slice(Lhat, k), _slice(U, k - 1), 1.0, _slice(D, k))
+    for k in 1:K
         _batched_inverse!(tmp, _slice(D, k))
         _slice(Dinv, k) .= tmp
+        for d in 1:min(w, K - k)
+            _batched_gemm!('N', 'N', 1.0, _band(L, K, k + d, d), _slice(Dinv, k), 0.0, tmp)
+            _band(Lhat, K, k + d, d) .= tmp
+        end
+        for d1 in 1:min(w, K - k), d2 in 1:min(w, K - k)
+            _batched_gemm!('N', 'N', -1.0, _band(Lhat, K, k + d1, d1), _band(U, K, k, d2), 1.0, _block(D, L, U, K, k + d1, k + d2))
+        end
     end
     Sinv = similar(S)
     if nbd > 0
-        # Y = T⁻¹ U, in place
-        tmp = similar(Y, sb, nbd, B)
-        for k in 2:K
-            _batched_gemm!('N', 'N', -1.0, _slice(Lhat, k), _slice(Y, k - 1), 1.0, _slice(Y, k))
-        end
-        for k in K:-1:1
-            k < K && _batched_gemm!('N', 'N', -1.0, _slice(U, k), _slice(Y, k + 1), 1.0, _slice(Y, k))
-            _batched_gemm!('N', 'N', 1.0, _slice(Dinv, k), _slice(Y, k), 0.0, tmp)
-            _slice(Y, k) .= tmp
-        end
+        _chain_solve!(Y, Dinv, Lhat, U, K, w, similar(Y, sb, nbd, B))   # Y = T⁻¹ U, in place
         for k in 1:K
             _batched_gemm!('N', 'N', -1.0, _slice(V, k), _slice(Y, k), 1.0, S)
         end
         _batched_inverse!(Sinv, S)
     end
-    work = (f=similar(S, sb, 1, B, K), x=similar(S, sb, 1, B, K), g=similar(S, nbd, 1, B), y=similar(S, nbd, 1, B),
+    work = (f=similar(S, sb, 1, B, K), g=similar(S, nbd, 1, B), y=similar(S, nbd, 1, B), tmp=similar(S, sb, 1, B),
         chain=similar(S, sb * K, B))
-    return BlockCoarseFactors(sb, K, nbd, Dinv, Lhat, U, Y, V, Sinv, work)
+    return BlockCoarseFactors(sb, K, nbd, w, Dinv, Lhat, U, Y, V, Sinv, work)
+end
+
+# F = T⁻¹ F in place, the blocks of F in F[:, :, :, k]; `tmp` is one block of F
+function _chain_solve!(F, Dinv, Lhat, U, K, w, tmp)
+    for i in 2:K, d in 1:min(w, i - 1)
+        _batched_gemm!('N', 'N', -1.0, _band(Lhat, K, i, d), _slice(F, i - d), 1.0, _slice(F, i))
+    end
+    for k in K:-1:1
+        for d in 1:min(w, K - k)
+            _batched_gemm!('N', 'N', -1.0, _band(U, K, k, d), _slice(F, k + d), 1.0, _slice(F, k))
+        end
+        _batched_gemm!('N', 'N', 1.0, _slice(Dinv, k), _slice(F, k), 0.0, tmp)
+        _slice(F, k) .= tmp
+    end
+    return F
 end
 
 function _solve_batch!(X::AbstractMatrix, F::BlockCoarseFactors, R::AbstractMatrix)
     sb, K, nbd, B = F.sb, F.K, F.nbd, size(R, 2)
     nch = sb * K
-    f, x, g, y = F.work.f, F.work.x, F.work.g, F.work.y
+    f, g, y = F.work.f, F.work.g, F.work.y
     F.work.chain .= view(R, 1:nch, :)
     permutedims!(reshape(f, sb, B, K), reshape(F.work.chain, sb, K, B), (1, 3, 2))
     reshape(g, nbd, B) .= view(R, (nch+1):(nch+nbd), :)
-    # x = T⁻¹ f
-    for k in 2:K
-        _batched_gemm!('N', 'N', -1.0, _slice(F.Lhat, k), _slice(f, k - 1), 1.0, _slice(f, k))
-    end
-    for k in K:-1:1
-        k < K && _batched_gemm!('N', 'N', -1.0, _slice(F.U, k), _slice(x, k + 1), 1.0, _slice(f, k))
-        _batched_gemm!('N', 'N', 1.0, _slice(F.Dinv, k), _slice(f, k), 0.0, _slice(x, k))
-    end
+    _chain_solve!(f, F.Dinv, F.Lhat, F.U, K, F.w, F.work.tmp)   # x = T⁻¹ f, in f
     # border, then the correction of x
     if nbd > 0
         for k in 1:K
-            _batched_gemm!('N', 'N', -1.0, _slice(F.V, k), _slice(x, k), 1.0, g)
+            _batched_gemm!('N', 'N', -1.0, _slice(F.V, k), _slice(f, k), 1.0, g)
         end
         _batched_gemm!('N', 'N', 1.0, F.Sinv, g, 0.0, y)
         for k in 1:K
-            _batched_gemm!('N', 'N', -1.0, _slice(F.Y, k), y, 1.0, _slice(x, k))
+            _batched_gemm!('N', 'N', -1.0, _slice(F.Y, k), y, 1.0, _slice(f, k))
         end
     end
-    permutedims!(reshape(F.work.chain, sb, K, B), reshape(x, sb, B, K), (1, 3, 2))
+    permutedims!(reshape(F.work.chain, sb, K, B), reshape(f, sb, B, K), (1, 3, 2))
     view(X, 1:nch, :) .= F.work.chain
     view(X, (nch+1):(nch+nbd), :) .= reshape(y, nbd, B)
     return X
@@ -214,20 +228,24 @@ end
 # ------------------------------------------------------------------------------------
 # Plane matrices by dense blocks. On a plane the unknowns are coupled along θ around the
 # torus and along the pitch angle α, which does not wrap, through the advection stencil
-# and the pitch angle scattering. Numbered with θ fastest, a block of `h` consecutive
-# pitch angles (`h` the reach in α) with all their poloidal points couples to its two
-# neighbours only, and the plane matrix is the chain of the coarse matrices with
-# `sb = h nt`; the pitch angles left over when `h` does not divide `nalpha` form the
-# border. The work is that of a banded LU of bandwidth `sb`, in batched dense kernels.
+# and the pitch angle scattering, `h` pitch angles either way. Numbered with θ fastest,
+# `p` consecutive pitch angles with all their poloidal points form a block of size
+# `sb = p nt`, which couples to the `⌈h/p⌉` blocks either side; the pitch angles left
+# over when `p` does not divide `nalpha` form the border. The work is that of a banded
+# LU of bandwidth `h nt`, in batched dense kernels; smaller blocks (`p = 1`) need fewer
+# operations in the batched inverses, which are slower than the products.
+
+# pitch angles per block of the plane matrices
+const PLANE_BLOCK_POINTS = Ref(1)
 
 "Block sizes of the plane matrices, numbered with θ fastest, or `nothing` if α is too short."
-function _plane_block_layout(op::DKEOperator)
+function _plane_block_layout(op::DKEOperator; points::Integer=PLANE_BLOCK_POINTS[])
     na, nt = state_size(op)[1:2]
     tr = op.trajectories
     D = op.collisions.D
     reach = max(_stencil_reach(tr.Da, na; periodic=false),
         maximum((abs(a - a2) for a in 1:na, a2 in 1:na if D[a, a2] != 0); init=0))
-    return _chain_layout(reach, na, nt, 0; periodic=false)
+    return _chain_layout(reach, na, nt, 0; periodic=false, points)
 end
 
 "Maps to the blocks of the plane matrices, which are numbered with θ fastest."

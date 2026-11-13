@@ -35,14 +35,15 @@ _to_device(::Val{:cuda}, A::SparseMatrixCSC{Float64}) = cuSPARSE.CuSparseMatrixC
 # the work arrays of the operator and the preconditioner, the factors and the arrays
 # that live only while they are built. With cuDSS for the planes about 4000 at
 # 65 × 41 × 6 × 3 unknowns; with blocks of size `sb` and a border of `nbd` for the
-# planes 3700 at 65 × 41 (sb = 82) and 4600 at 257 × 61 (sb = 122), measured, which
-# `8 (250 + 3 sb + 2 nbd)` bounds.
+# planes 3700 at 65 × 41 (sb = 82) and 4600 at 257 × 61 (sb = 122) with two pitch angles
+# a block (w = 1), measured, which `8 (250 + (1 + 2w) sb + 2 nbd)` bounds.
 const BYTES_PER_UNKNOWN = Ref(8 * 600)
 const BYTES_PER_UNKNOWN_BESIDES_PLANES = Ref(8 * 250)
 
 function _default_batchsize(::Val{:cuda}, ncases::Integer, unknowns::Integer, restart::Integer, planes)
     budget = CUDA.free_memory() ÷ 2
-    perunknown = planes === nothing ? BYTES_PER_UNKNOWN[] : BYTES_PER_UNKNOWN_BESIDES_PLANES[] + 8 * (3planes.sb + 2planes.nbd)
+    perunknown = planes === nothing ? BYTES_PER_UNKNOWN[] :
+                 BYTES_PER_UNKNOWN_BESIDES_PLANES[] + 8 * ((1 + 2planes.w) * planes.sb + 2planes.nbd)
     return clamp(budget ÷ (perunknown * unknowns), 1, ncases)
 end
 
@@ -56,10 +57,10 @@ end
 _synchronize(::Val{:cuda}) = CUDA.synchronize()
 _release(::Val{:cuda}) = (GC.gc(); CUDA.reclaim(); nothing)
 _default_coarse_solver(::Val{:cuda}) = :block
-# Dense blocks do more arithmetic than a sparse LU and win only on large planes: on an
-# A100, cuDSS is faster at 65 × 41 and 97 × 41, the two are even at 129 × 41 (5300
-# unknowns a plane) and blocks are 1.7 times faster for the whole solve at 257 × 61.
-const MIN_BLOCK_PLANE = Ref(6000)
+# Dense blocks of one pitch angle do more arithmetic than a sparse LU and win on all but
+# small planes: for whole solves on an A100 the two are even at 65 × 41 (2700 unknowns a
+# plane), blocks are 1.3 times faster at 129 × 41 and 2.2 times at 257 × 61.
+const MIN_BLOCK_PLANE = Ref(2500)
 _default_plane_solver(::Val{:cuda}, op) = prod(Yancc.state_size(op)[1:2]) >= MIN_BLOCK_PLANE[] ? :block : :sparse
 
 function _batched_inverse!(C::CuArray{Float64,3}, A::CuArray{Float64,3})

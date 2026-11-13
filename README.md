@@ -180,9 +180,9 @@ The cases must share the grids, the stencils and the options of the operator; th
 field, the plasma and the electric field may differ. The method is that of
 `solve_dke_tokamak`, with all cases iterated together and the matrices of the
 preconditioner built, factored and solved as batches on the device: the coarse
-matrices, and the plane matrices from 6000 unknowns (`nalpha × ntheta`) up, by a dense
+matrices, and the plane matrices from 2500 unknowns (`nalpha × ntheta`) up, by a dense
 block elimination in batched cuBLAS kernels, smaller plane matrices by cuDSS, which is
-faster for them. The operators and the fluxes are computed on the host, on all Julia
+as fast for them. The operators and the fluxes are computed on the host, on all Julia
 threads. Cases are solved in pieces that fit in the memory of the device (4 to 6 kB per
 unknown and case; `batchsize` sets the size), and a case whose batched factorization
 fails is solved again on the host.
@@ -198,15 +198,15 @@ single threaded process per core, 128 in all):
 
 | `nalpha` × `ntheta` | unknowns | one A100 | four A100 | CPU node |
 |---|---|---|---|---|
-| 65 × 41 | 48 000 | 100 | 393 | 69 |
-| 257 × 61 | 282 000 | 10.0 | 40 | 17 |
+| 65 × 41 | 48 000 | 108 | 422 | 69 |
+| 257 × 61 | 282 000 | 13.1 | 51 | 17 |
 
 (1024 and 128 cases per GPU; the cases differ in aspect ratio, safety factor, density,
 temperature and radial electric field and take 6 to 7 iterations each.) The GPU numbers
 leave out the construction of the operators on the host, which takes 1.4 s for 1024
-cases on 32 threads and lowers the first row to about 88 per GPU. Between the two rows
-the plane matrices change from cuDSS to blocks; with cuDSS the second row would be 5.9
-solves per second on one A100.
+cases on 32 threads and lowers the first row to about 94 per GPU. With cuDSS for the
+plane matrices instead of blocks the two rows would be 107 and 6.0 solves per second on
+one A100.
 `benchmark/batch_throughput.jl` and `benchmark/single_throughput.jl` reproduce the
 table; the GPU tests run with `YANCC_TEST_GPU=1`.
 
