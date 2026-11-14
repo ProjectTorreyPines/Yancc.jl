@@ -67,7 +67,7 @@ function _solve_chunk!(sols, status, seconds, maps, ops, epar, chunk, dev::Val; 
     N, M = prod(state_size(first(cases))), system_size(first(cases))
 
     # operators, right hand sides and preconditioner matrices
-    local bop, planes_coarse, rhs
+    local bop, planes_coarse, rhs   # COV_EXCL_LINE
     seconds[:assemble] += @elapsed begin
         # the same structure for every chunk, whichever cases have an electric field
         speed = any(op.trajectories.has_speed for op in ops) && first(ops).weights[1] != 0
@@ -82,7 +82,7 @@ function _solve_chunk!(sols, status, seconds, maps, ops, epar, chunk, dev::Val; 
         planes_coarse = _assemble_preconditioner(maps[], bop)
         _synchronize(dev)
     end
-    local pre
+    local pre   # COV_EXCL_LINE
     seconds[:factor] += @elapsed begin
         pre = BatchedTokamakPreconditioner(maps[], bop, planes_coarse..., dev)
         planes_coarse = nothing   # the factors replace the assembled blocks
@@ -90,7 +90,7 @@ function _solve_chunk!(sols, status, seconds, maps, ops, epar, chunk, dev::Val; 
     end
 
     # GMRES in the scaled norm of the single case solver
-    local Xh, iterations, residuals, stat
+    local Xh, iterations, residuals, stat   # COV_EXCL_LINE
     seconds[:iterate] += @elapsed begin
         S = bop.data.scaling
         Bd = rhs
@@ -110,7 +110,7 @@ function _solve_chunk!(sols, status, seconds, maps, ops, epar, chunk, dev::Val; 
             stat[b] == :failed && continue
             sols[chunk[b]] = DKESolution(cases[b], view(Xh, :, b); iterations=iterations[b], residual=residuals[b])
             status[chunk[b]] = stat[b]
-        end
+        end   # COV_EXCL_LINE (counted, never marked run)
     end
     _free!(bop)
     seconds[:iterate] += @elapsed _solve_failed!(sols, status, ops, epar, chunk[stat.==:failed]; rtol, restart, maxiter)
@@ -124,6 +124,6 @@ function _solve_failed!(sols, status, ops, epar, failed; rtol, restart, maxiter)
     Threads.@threads for k in failed
         sol, stat = _solve_dke_tokamak(ops[k], TokamakPreconditioner(ops[k]), nothing; EparB=epar[k], rtol, restart, maxiter)
         sols[k], status[k] = sol, isfinite(sol.residual) ? stat : :failed
-    end
+    end   # COV_EXCL_LINE (counted, never marked run)
     return nothing
 end

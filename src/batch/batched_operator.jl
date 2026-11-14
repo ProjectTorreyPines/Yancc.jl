@@ -116,7 +116,7 @@ function BatchedDKE(ops::AbstractVector{<:DKEOperator{Float64}}, device::Val;
                 border_scale[2(s-1)+k, b] = 1 / (4π^2 * sum(wxig) * sum(drb) * moments[k] * sp(0.0))
             end
         end
-    end
+    end   # COV_EXCL_LINE (counted, never marked run)
 
     # (names distinct from those of the threaded loop above, which must stay local to it)
     tr1, col1 = op1.trajectories, op1.collisions
@@ -243,7 +243,7 @@ function _batched_rhs(ops::AbstractVector{<:DKEOperator{Float64}}, EparB::Abstra
             c1[1, 1, i, s, b] = (A1 + x[i]^2 * A2) * sp.species.mass * v^2 / sp.species.charge * F
             c2[1, 1, i, s, b] = A3 * v * F
         end
-    end
+    end   # COV_EXCL_LINE (counted, never marked run)
     like(A) = _like(bop.data.scaling, A)
     R = fill!(similar(bop.data.scaling, N + 2ns, B), 0)
     view(R, 1:N, :) .= reshape(like(reshape(1 .+ xi .^ 2, na, 1, 1, 1, 1)) .* like(h1) .* like(c1) .+

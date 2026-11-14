@@ -74,8 +74,8 @@ end
     C = Yancc._batched_gemm!('N', 'N', 2.0, A, B, 0.0, zeros(3, 5, 2))
     @test C[:, :, 2] ≈ 2 * A[:, :, 2] * B[:, :, 2]
     @test_throws ErrorException Yancc._batched_gemm!('N', 'T', 1.0, A, A, 0.0, zeros(3, 3, 2))
-    @test Yancc._default_coarse_solver(Val(:cpu)) == :sparse
-    @test Yancc._default_plane_solver(Val(:cpu), batch_cases()[1]) == :sparse
+    @test Yancc._default_coarse_solver(Base.inferencebarrier(Val(:cpu))) == :sparse
+    @test Yancc._default_plane_solver(Base.inferencebarrier(Val(:cpu)), batch_cases()[1]) == :sparse
     # threads over chunks cover every index once
     seen = zeros(Int, 37)
     Yancc._foreach_chunk(chunk -> (seen[chunk] .+= 1), 37)

@@ -16,7 +16,7 @@ function _pick_device(device::Symbol)
     if device == :auto
         for (name, functional) in _DEVICE_FUNCTIONAL
             functional() && return Val(name)
-        end
+        end   # COV_EXCL_LINE (counted, never marked run)
         return Val(:cpu)
     end
     haskey(_DEVICE_FUNCTIONAL, device) ||
@@ -106,7 +106,7 @@ function _foreach_chunk(f, n::Integer)
     nchunks <= 1 && return f(1:n)
     @sync for chunk in Iterators.partition(1:n, cld(n, nchunks))
         Threads.@spawn f(chunk)
-    end
+    end   # COV_EXCL_LINE (counted, never marked run)
     return nothing
 end
 
