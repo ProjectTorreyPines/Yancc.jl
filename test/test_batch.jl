@@ -45,6 +45,51 @@ end
     @test iterations[2] <= 1 && isnan(residuals[2])
     @test iterations[[1, 3, 4, 5]] == reference[[1, 3, 4, 5]]
     @test all(X[:, k] ≈ As[k] \ B[:, k] for k in (1, 3, 5))
+    # an operator without a new direction (here zero) ends the iteration of its system
+    Azero!(Y, V) = (A!(Y, V); Y[:, 2] .= 0; Y)
+    _, iterations, residuals, status = Yancc.gmres_batched!(zeros(n, nb), Azero!, copy(B), M!; rtol=1e-12)
+    @test status[2] == :maxiter && iterations[2] == 0 && residuals[2] == 1
+    @test status[[1, 3, 4, 5]] == fill(:converged, 4)
+    # no iterations, and a right hand side that is not finite
+    Bnan = copy(B)
+    Bnan[1, 3] = NaN
+    _, iterations, residuals, status = Yancc.gmres_batched!(zeros(n, nb), A!, Bnan, M!; maxiter=0)
+    @test all(iszero, iterations) && status == [:maxiter, :maxiter, :failed, :converged, :maxiter]
+    # a residual that is not finite at the end of a cycle
+    X0 = zeros(n, nb)
+    Alate!(Y, V) = (A!(Y, V); V === X0 && (Y[1, 2] = NaN); Y)
+    _, _, residuals, status = Yancc.gmres_batched!(X0, Alate!, copy(B), M!; rtol=1e-12)
+    @test status == [:converged, :failed, :converged, :converged, :converged] && isnan(residuals[2])
+    # a preconditioner that changes from call to call: the recurrence converges, the
+    # residual does not
+    calls = Ref(0)
+    Mvar!(Z, V) = (calls[] += 1; M!(Z, V); Z[:, 1] .*= 1 + 0.5 * sin(calls[]); Z)
+    _, _, residuals, status = Yancc.gmres_batched!(zeros(n, nb), A!, copy(B), Mvar!; rtol=1e-12)
+    @test status[1] == :stagnated && residuals[1] > 1e-12
+    @test status[2:5] == fill(:converged, 4)
+end
+
+@testset "batched seams on the host" begin
+    A, B = rand(3, 4, 2), rand(4, 5, 2)
+    C = Yancc._batched_gemm!('N', 'N', 2.0, A, B, 0.0, zeros(3, 5, 2))
+    @test C[:, :, 2] ≈ 2 * A[:, :, 2] * B[:, :, 2]
+    @test_throws ErrorException Yancc._batched_gemm!('N', 'T', 1.0, A, A, 0.0, zeros(3, 3, 2))
+    @test Yancc._default_coarse_solver(Val(:cpu)) == :sparse
+    @test Yancc._default_plane_solver(Val(:cpu), batch_cases()[1]) == :sparse
+    # threads over chunks cover every index once
+    seen = zeros(Int, 37)
+    Yancc._foreach_chunk(chunk -> (seen[chunk] .+= 1), 37)
+    @test all(==(1), seen)
+    # device selection through the registry the extensions fill
+    try
+        Yancc._DEVICE_FUNCTIONAL[:testdevice] = () -> true
+        @test Yancc._pick_device(:auto) == Val(:testdevice)
+        @test Yancc._pick_device(:testdevice) == Val(:testdevice)
+        Yancc._DEVICE_FUNCTIONAL[:testdevice] = () -> false
+        @test_throws ErrorException Yancc._pick_device(:testdevice)
+    finally
+        delete!(Yancc._DEVICE_FUNCTIONAL, :testdevice)
+    end
 end
 
 @testset "batched operator: Erho = $(Erho[2]), exchange = $energy_exchange" for (Erho, energy_exchange) in
@@ -71,6 +116,14 @@ end
     maps = Yancc.PreconditionerMaps(ops[1], 4, bop.has_speed, Val(:cpu))
     planes, coarse = Yancc._assemble_preconditioner(maps, bop)
     na, nt, nz, nx, ns = Yancc.state_size(ops[1])
+    @test Yancc.state_size(bop) == (na, nt, nx, ns) && Yancc.system_size(bop) == M
+    @test Yancc.nnz(maps.planes) == Yancc.nnz(planes) && Yancc.nnz(maps.coarse) == Yancc.nnz(coarse)
+    # the preconditioner from the operators, against the one from the maps
+    R = reduce(hcat, [test_vector(M) .* k for k in eachindex(ops)])
+    pre = Yancc.BatchedTokamakPreconditioner(ops, bop, Val(:cpu))
+    pre_maps = Yancc.BatchedTokamakPreconditioner(maps, bop, planes, coarse, Val(:cpu))
+    # (R is overwritten)
+    @test Yancc._precondition!(similar(R), pre, copy(R), bop) ≈ Yancc._precondition!(similar(R), pre_maps, copy(R), bop) rtol = 1e-12
     close(A, B) = norm(A - B, Inf) <= 1e-12 * norm(B, Inf)
     for (k, op) in enumerate(ops)
         @test close(Yancc._matrix(coarse, k), first(Yancc.moment_coarse_matrix(op, borders[k], 4)))
