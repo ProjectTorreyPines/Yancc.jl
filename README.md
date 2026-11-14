@@ -15,7 +15,7 @@ so that the model can be used inside the transport loop of
 [FUSE](https://github.com/ProjectTorreyPines/FUSE.jl). The original code
 ([repository](https://github.com/f0uriest/yancc),
 [documentation](https://yancc.readthedocs.io/)) remains the reference implementation:
-it is the one to use for stellarators, on GPUs, and for anything not listed as ported
+it is the one to use for stellarators, for differentiation, and for anything not listed as ported
 below.
 
 If you use Yancc.jl, please cite their paper, see [Citation](#citation).
@@ -36,7 +36,8 @@ If you use Yancc.jl, please cite their paper, see [Citation](#citation).
 | GCROT Krylov solver with geometric multigrid, for stellarators | not yet |
 | Monoenergetic equation and transport coefficients | not yet |
 | Automatic differentiation | forward mode with ForwardDiff, with respect to the plasma profiles, see below |
-| Ambipolar electric field, GPU | not yet |
+| GPU | batches of tokamak solves (`solve_dke_tokamak_batch`), specific to Yancc.jl, see below |
+| Ambipolar electric field | not yet |
 
 ## Example
 
@@ -182,6 +183,57 @@ the electron particle flux.
 The dense solver `solve_dke_reference` works with dual numbers as it is. The charge of a
 species may be a dual number too, as for an average charge state that depends on the
 temperature. The field is plain numbers, and reverse mode is not implemented.
+
+## Many solves at once, on a GPU
+
+`solve_dke_tokamak_batch` solves many flux surfaces or scan points together, as needed
+for profiles and for databases:
+
+```julia
+using Yancc, CUDA, CUDSS          # without CUDA and CUDSS: device = :cpu
+
+ops = [DKEOperator(field, UniformPitchAngleGrid(65), MaxwellSpeedGrid(6), species; p1="4z")
+       for (field, species) in cases]
+sols = solve_dke_tokamak_batch(ops; device=:cuda)    # one DKESolution per case
+```
+
+The cases must share the grids, the stencils and the options of the operator; the
+field, the plasma and the electric field may differ. The method is that of
+`solve_dke_tokamak`, with all cases iterated together and the matrices of the
+preconditioner built, factored and solved as batches on the device: the coarse
+matrices, and the plane matrices from 2500 unknowns (`nalpha × ntheta`) up, by a dense
+block elimination in batched cuBLAS kernels, smaller plane matrices by cuDSS, which is
+as fast for them. The operators and the fluxes are computed on the host, on all Julia
+threads. Cases are solved in pieces that fit in the memory of the device (4 to 6 kB per
+unknown and case; `batchsize` sets the size), and a case whose batched factorization
+fails is solved again on the host.
+
+CUDA.jl and CUDSS.jl are weak dependencies: they are loaded only when the user loads
+them, and only NVIDIA GPUs are supported. A solve on its own does not gain from a GPU,
+and on the host one `solve_dke_tokamak` per process and core is faster than
+`device = :cpu`, which is there for testing.
+
+Solves per second for D + C + e with `nx = 6`, to `rtol = 1e-6`, on a Perlmutter GPU
+node (four A100 with 40 GB, one process per GPU) and on a CPU node (two EPYC 7763, one
+single threaded process per core, 128 in all):
+
+| `nalpha` × `ntheta` | unknowns | one A100 | four A100 | CPU node |
+|---|---|---|---|---|
+| 65 × 41 | 48 000 | 163 | 644 | 69 |
+| 257 × 61 | 282 000 | 18.0 | 72 | 17 |
+
+(1024 and 128 cases per GPU; the cases differ in aspect ratio, safety factor, density,
+temperature and radial electric field and take 6 to 7 iterations each.) The GPU numbers
+leave out the construction of the operators on the host, which takes 1.4 s for 1024
+cases on 32 threads and lowers the first row to about 133 per GPU. With cuDSS for the
+plane matrices instead of blocks the second row is about half as fast.
+`benchmark/batch_throughput.jl` and `benchmark/single_throughput.jl` reproduce the
+table; the GPU tests run with `YANCC_TEST_GPU=1`.
+
+Two processes per GPU under CUDA MPS raise the node throughput to 743 and 80 solves
+per second for the two rows. Start `nvidia-cuda-mps-control -d` before the processes,
+set `JULIA_CUDA_USE_COMPAT=false`, and give each process a `batchsize` of about 0.8
+times the single-process default.
 
 ## Use in FUSE
 

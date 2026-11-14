@@ -9,12 +9,17 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 
 [weakdeps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+CUDSS = "45b445bb-4962-46a0-9369-b4df9d0f772e"
 ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
 
 [extensions]
+YanccCUDAExt = ["CUDA", "CUDSS"]
 YanccForwardDiffExt = "ForwardDiff"
 
 [compat]
+CUDA = "6"
+CUDSS = "0.8"
 ForwardDiff = "0.10, 1"
 LinearAlgebra = "1"
 NPZ = "0.4"
