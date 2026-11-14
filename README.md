@@ -210,6 +210,11 @@ one A100.
 `benchmark/batch_throughput.jl` and `benchmark/single_throughput.jl` reproduce the
 table; the GPU tests run with `YANCC_TEST_GPU=1`.
 
+Two processes per GPU under CUDA MPS raise the node throughput to 473 and 55 solves
+per second for the two rows. Start `nvidia-cuda-mps-control -d` before the processes,
+set `JULIA_CUDA_USE_COMPAT=false`, and give each process a `batchsize` of about 0.8
+times the single-process default.
+
 ## Use in FUSE
 
 `NeoclassicalTransport.yancc` builds the Miller flux surface and the species
