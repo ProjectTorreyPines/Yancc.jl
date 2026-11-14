@@ -344,7 +344,7 @@ end
 
 """
     solve_dke_tokamak(op; EparB=0, rtol=1e-6, restart=80, maxiter=400,
-                      preconditioner=TokamakPreconditioner(op), guess=nothing)
+                      preconditioner=TokamakPreconditioner(op), guess=nothing, tangent_rtol=1e-6)
 
 Solve the drift kinetic equation on a flux surface of an axisymmetric field
 (`nzeta = 1`) by preconditioned GMRES. `rtol` is the relative residual of the kinetic
@@ -355,11 +355,16 @@ equation in the norm `∫d³v ⟨r²/F_M⟩ / n` summed over species.
 
 Deep in the Pfirsch-Schlüter regime rounding limits the residual, which may stop above
 a small `rtol`; there is a warning when it stops above 1e-6.
+
+With ForwardDiff loaded, `op` and `EparB` may hold dual numbers. The equation is then
+solved at their values, and the derivative of the solution in each direction by one more
+linear solve with the same preconditioner, to the relative residual `tangent_rtol`.
 """
 function solve_dke_tokamak(op::DKEOperator{Float64}; EparB::Real=0.0, rtol::Real=1e-6, restart::Integer=80,
     maxiter::Integer=400, preconditioner::TokamakPreconditioner=TokamakPreconditioner(op),
-    guess::Union{Nothing,DKESolution}=nothing)
+    guess::Union{Nothing,DKESolution}=nothing, tangent_rtol::Real=1e-6)
 
+    _plain(EparB) || return _solve_dual(nothing, op, EparB; rtol, restart, maxiter, preconditioner, guess, tangent_rtol)
     sol, status = _solve_dke_tokamak(op, preconditioner, guess; EparB, rtol, restart, maxiter)
     if status == :maxiter
         @warn "solve_dke_tokamak: relative residual $(sol.residual) after $(sol.iterations) iterations, rtol = $rtol"
@@ -368,6 +373,13 @@ function solve_dke_tokamak(op::DKEOperator{Float64}; EparB::Real=0.0, rtol::Real
     end
     return sol
 end
+
+_plain(x::Real) = x isa Union{AbstractFloat,Integer,Rational,AbstractIrrational}
+
+# Solve for an operator or an `EparB` of dual numbers; the method is in the ForwardDiff extension.
+_solve_dual(cache, op, EparB; kw...) =
+    error("solve_dke_tokamak: an operator of $(typeof(op.Erho)) with EparB of $(typeof(EparB)) needs ForwardDiff to be loaded")
+solve_dke_tokamak(op::DKEOperator; EparB::Real=0.0, kw...) = _solve_dual(nothing, op, EparB; kw...)
 
 function _solve_dke_tokamak(op::DKEOperator{Float64}, preconditioner::TokamakPreconditioner, guess; EparB, rtol, restart, maxiter)
     @assert op.field.nzeta == 1 "the tokamak solver needs nzeta = 1"
@@ -408,16 +420,27 @@ mutable struct TokamakCache
     base_vector::Vector{Float64}
     base_residual::Vector{Float64}
     base_residual_norm::Float64
-    solves::Int             # calls, preconditioners built and GMRES iterations so far
+    # derivative solves for the plasma `tangent_state`: right hand sides (orthonormal in the
+    # scaled norm) and their solutions, see `_solve_tangents`
+    tangent_state::Vector{Float64}
+    tangent_rhs::Matrix{Float64}
+    tangent_sol::Matrix{Float64}
+    solves::Int             # calls, preconditioners built, GMRES iterations and derivative solves so far
     rebuilds::Int
     iterations::Int
+    tangent_solves::Int
 end
-TokamakCache() = TokamakCache(nothing, nothing, (0, 0, 0, 0, 0), 0, Float64[], Float64[], Float64[], Float64[], 0.0, 0, 0, 0)
+TokamakCache() = TokamakCache(nothing, nothing, (0, 0, 0, 0, 0), 0, Float64[], Float64[], Float64[], Float64[], 0.0,
+    Float64[], zeros(0, 0), zeros(0, 0), 0, 0, 0, 0)
+
+# inputs closer than this (relative) are the same point: rounding of two evaluations of the same profiles
+const SAME_INPUT = 1e-12
 
 _plasma_state(op::DKEOperator) = Float64[(sp.temperature for sp in op.species)..., (sp.density for sp in op.species)...,
-    (sp.temperature for sp in op.background)..., (sp.density for sp in op.background)..., op.Erho]
+    (sp.temperature for sp in op.background)..., (sp.density for sp in op.background)...,
+    (sp.species.charge for sp in op.species)..., (sp.species.charge for sp in op.background)..., op.Erho]
 
-# largest relative change of a temperature or density, or of Erho, since `reference`
+# largest relative change of a temperature, density or charge, or of Erho, since `reference`
 function _plasma_change(op::DKEOperator, reference::Vector{Float64})
     state = _plasma_state(op)
     length(state) == length(reference) || return Inf
@@ -428,8 +451,8 @@ end
 function _input_state(op::DKEOperator, EparB::Real)
     state, scale = Float64[], Float64[]
     for sp in Iterators.flatten((op.species, op.background))
-        append!(state, (sp.temperature, sp.density, sp.dTdrho, sp.dndrho))
-        append!(scale, (sp.temperature, sp.density, abs(sp.dTdrho) + sp.temperature, abs(sp.dndrho) + sp.density))
+        append!(state, (sp.temperature, sp.density, sp.dTdrho, sp.dndrho, sp.species.charge))
+        append!(scale, (sp.temperature, sp.density, abs(sp.dTdrho) + sp.temperature, abs(sp.dndrho) + sp.density, abs(sp.species.charge)))
     end
     T = op.species[1].temperature
     append!(state, (op.Erho, EparB))
@@ -445,7 +468,7 @@ end
 
 """
     solve_dke_tokamak!(cache, op; EparB=0, rtol=1e-6, restart=80, maxiter=400,
-                       max_change=0.2, perturbation=1e-5, perturbation_rtol=1e-4)
+                       max_change=0.2, perturbation=1e-5, perturbation_rtol=1e-4, tangent_rtol=1e-6)
 
 [`solve_dke_tokamak`](@ref) starting from the last solution in `cache` and reusing its
 preconditioner. The preconditioner is rebuilt and the solve starts afresh when the
@@ -461,16 +484,25 @@ with solution `y₀` and residual `r₀ = b₀ - A₀ y₀`, the solution return
 `y₀ + δ` with `A δ = b - A y₀ - r₀` solved to `perturbation_rtol` relative to its own
 right hand side: `δ` vanishes for unchanged inputs, and the fluxes are those of
 `A⁻¹ (b - r₀)`, a smooth function of the inputs within `rtol` of the exact one.
+
+For dual numbers (see [`solve_dke_tokamak`](@ref)) the derivatives are those of that
+function. The cache keeps the directions solved for the current temperatures, densities,
+charges and `Erho`, and later calls at the same plasma solve only for directions outside
+their span, as when ForwardDiff evaluates a Jacobian in several chunks.
 """
 function solve_dke_tokamak!(cache::TokamakCache, op::DKEOperator{Float64}; EparB::Real=0.0, rtol::Real=1e-6,
-    restart::Integer=80, maxiter::Integer=400, max_change::Real=0.2, perturbation::Real=1e-5, perturbation_rtol::Real=1e-4)
+    restart::Integer=80, maxiter::Integer=400, max_change::Real=0.2, perturbation::Real=1e-5, perturbation_rtol::Real=1e-4,
+    tangent_rtol::Real=1e-6)
+    _plain(EparB) || return _solve_dual(cache, op, EparB; rtol, restart, maxiter, max_change, perturbation, perturbation_rtol, tangent_rtol)
     dims = state_size(op)
     cache.solves += 1
     reusable = cache.preconditioner !== nothing && cache.solution !== nothing && cache.dims == dims
     budget = min(maxiter, cache.fresh_iterations + 5)
 
     # perturbation of the last full solve
-    if reusable && cache.base_residual_norm <= rtol && _input_change(op, EparB, cache.base_state) <= perturbation
+    change = reusable && cache.base_residual_norm <= rtol ? _input_change(op, EparB, cache.base_state) : Inf
+    change <= SAME_INPUT && return DKESolution(op, copy(cache.base_vector); iterations=0, residual=cache.base_residual_norm)
+    if change <= perturbation
         border = DKEBorder(op)
         N = prod(dims)
         b = zeros(system_size(op))
@@ -517,4 +549,46 @@ function solve_dke_tokamak!(cache::TokamakCache, op::DKEOperator{Float64}; EparB
     cache.base_residual = r
     cache.base_residual_norm = sol.residual
     return sol
+end
+solve_dke_tokamak!(cache::TokamakCache, op::DKEOperator; EparB::Real=0.0, kw...) = _solve_dual(cache, op, EparB; kw...)
+
+"""
+    _solve_tangents(R, op, border, preconditioner, Q, Z; rtol, restart, maxiter)
+
+Solutions `D` of `A D[:, k] = R[:, k]` for the bordered system of `op`, as needed for the
+derivatives of a solution: `A δ = ∂b - (∂A) y` for each direction of differentiation.
+
+`Q` holds right hand sides already solved with this operator, orthonormal in the scaled
+norm of the solver, and `Z` their solutions. Each column of `R` is projected on `Q`
+and only a remainder above `rtol` (relative to the column) is solved for and appended, so
+that directions spanning a small space, as the partials of successive ForwardDiff chunks
+do, cost one solve per dimension of that space. Returns `(D, Q, Z, solves, iterations)`.
+"""
+function _solve_tangents(R::AbstractMatrix{Float64}, op::DKEOperator{Float64}, border::DKEBorder, preconditioner::TokamakPreconditioner,
+    Q::Matrix{Float64}, Z::Matrix{Float64}; rtol::Real, restart::Integer, maxiter::Integer)
+    n, m = size(R)
+    S = _row_scaling(op, border)
+    D = zeros(n, m)
+    c = zeros(n)
+    solves = iterations = 0
+    for k in 1:m
+        c .= view(R, :, k) .* S
+        cnorm = norm(c)
+        cnorm == 0 && continue
+        for _ in 1:(size(Q, 2) > 0 ? 2 : 0)   # projection, repeated for orthogonality
+            a = Q' * c
+            mul!(view(D, :, k), Z, a, 1.0, 1.0)
+            mul!(c, Q, a, -1.0, 1.0)
+        end
+        remainder = norm(c)
+        remainder <= rtol * cnorm && continue
+        c ./= remainder
+        z, its, residual, status = _gmres_bordered!(zeros(n), op, border, preconditioner, c ./ S; rtol, restart, maxiter)
+        status == :maxiter && @warn "solve_dke_tokamak: derivative solve stopped at relative residual $residual after $its iterations"
+        Q, Z = hcat(Q, c), hcat(Z, z)
+        view(D, :, k) .+= remainder .* z
+        solves += 1
+        iterations += its
+    end
+    return D, Q, Z, solves, iterations
 end

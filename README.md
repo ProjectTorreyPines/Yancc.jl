@@ -1,3 +1,6 @@
+[![CI](https://github.com/ProjectTorreyPines/Yancc.jl/actions/workflows/runtests.yml/badge.svg?branch=master)](https://github.com/ProjectTorreyPines/Yancc.jl/actions/workflows/runtests.yml)
+[![codecov](https://codecov.io/github/ProjectTorreyPines/Yancc.jl/graph/badge.svg)](https://codecov.io/github/ProjectTorreyPines/Yancc.jl)
+
 # Yancc.jl
 
 Yancc.jl is a Julia port of [**yancc**](https://github.com/f0uriest/yancc) ("Yet Another
@@ -15,28 +18,7 @@ so that the model can be used inside the transport loop of
 it is the one to use for stellarators, for differentiation, and for anything not listed as ported
 below.
 
-## Citing
-
-If you use Yancc.jl, please cite the paper that introduced the method:
-
-> R. Conlin and M. Landreman, "yancc: a GPU-accelerated, differentiable solver for
-> neoclassical transport in tokamaks and stellarators",
-> *Plasma Phys. Control. Fusion* **68**, 115001 (2026).
-> [doi:10.1088/1361-6587/aeb628](https://doi.org/10.1088/1361-6587/aeb628)
-
-```bibtex
-@article{Conlin2026yancc,
-  author  = {Conlin, Rory and Landreman, Matt},
-  title   = {yancc: a {GPU}-accelerated, differentiable solver for neoclassical
-             transport in tokamaks and stellarators},
-  journal = {Plasma Physics and Controlled Fusion},
-  volume  = {68},
-  number  = {11},
-  pages   = {115001},
-  year    = {2026},
-  doi     = {10.1088/1361-6587/aeb628}
-}
-```
+If you use Yancc.jl, please cite their paper, see [Citation](#citation).
 
 ## What is ported
 
@@ -53,8 +35,9 @@ If you use Yancc.jl, please cite the paper that introduced the method:
 | Solver for axisymmetric fields | yes (`solve_dke_tokamak`), specific to Yancc.jl, see below |
 | GCROT Krylov solver with geometric multigrid, for stellarators | not yet |
 | Monoenergetic equation and transport coefficients | not yet |
+| Automatic differentiation | forward mode with ForwardDiff, with respect to the plasma profiles, see below |
 | GPU | batches of tokamak solves (`solve_dke_tokamak_batch`), specific to Yancc.jl, see below |
-| Ambipolar electric field, automatic differentiation | not yet |
+| Ambipolar electric field | not yet |
 
 ## Example
 
@@ -163,6 +146,44 @@ flow, which collisions determine only through small differences, is 4 % off at
 ill conditioned for double precision; `solve_dke_tokamak` warns when rounding stops
 the residual above 10⁻⁶. Both are properties of the discretization, not of the solver.
 
+## Automatic differentiation
+
+With ForwardDiff loaded, the species, `Erho` and `EparB` may be dual numbers, and the
+fluxes, flows and bootstrap current carry the derivatives. Continuing the example:
+
+```julia
+using ForwardDiff
+
+function ion_heat_flux(aLT)
+    species = [
+        from_scale_lengths(Deuterium, 2e3, 4.0e19, aLT, 1.0),
+        from_scale_lengths(Carbon, 2e3, 0.17e19, aLT, 1.0),
+        from_scale_lengths(Electron, 2e3, 5.0e19, 3.0, 1.0)
+    ]
+    op = DKEOperator(field, UniformPitchAngleGrid(65), MaxwellSpeedGrid(6), species; p1="4z")
+    return solve_dke_tokamak(op).heat_flux[1]
+end
+
+ForwardDiff.derivative(ion_heat_flux, 3.0)
+```
+
+`solve_dke_tokamak` differentiates the solution implicitly: the kinetic equation is
+solved once in plain numbers, and each direction of differentiation then costs one linear
+solve with the same operator and preconditioner, to the tolerance `tangent_rtol`. With a
+`TokamakCache`, `solve_dke_tokamak!` keeps the directions solved at the current plasma, so
+that the successive chunks of a ForwardDiff Jacobian cost one solve for each dimension of
+the space their directions span, e.g. six for the value and the gradient of three
+profiles, however many unknowns of a transport solver these depend on.
+
+For four species at 6 × 65 × 41 such a Jacobian takes about 2 s on one core and is accurate
+to 10⁻⁴ to 10⁻³ of its largest entries. Finite differences through the cache cost about
+1.5 s for every eight columns and are accurate to 10⁻³ for the ion energy flux and 10⁻¹ for
+the electron particle flux.
+
+The dense solver `solve_dke_reference` works with dual numbers as it is. The charge of a
+species may be a dual number too, as for an average charge state that depends on the
+temperature. The field is plain numbers, and reverse mode is not implemented.
+
 ## Many solves at once, on a GPU
 
 `solve_dke_tokamak_batch` solves many flux surfaces or scan points together, as needed
@@ -226,3 +247,26 @@ converged values at mid radius and 11 % above in the collisionless core, where
 ## License
 
 MIT, see `LICENSE`, which retains the copyright notice of yancc, and `NOTICE.md`.
+
+## Citation
+
+If you use Yancc.jl, please cite the paper that introduced the method:
+
+> R. Conlin and M. Landreman, "yancc: a GPU-accelerated, differentiable solver for
+> neoclassical transport in tokamaks and stellarators",
+> *Plasma Phys. Control. Fusion* **68**, 115001 (2026).
+> [doi:10.1088/1361-6587/aeb628](https://doi.org/10.1088/1361-6587/aeb628)
+
+```bibtex
+@article{Conlin2026yancc,
+  author  = {Conlin, Rory and Landreman, Matt},
+  title   = {yancc: a {GPU}-accelerated, differentiable solver for neoclassical
+             transport in tokamaks and stellarators},
+  journal = {Plasma Physics and Controlled Fusion},
+  volume  = {68},
+  number  = {11},
+  pages   = {115001},
+  year    = {2026},
+  doi     = {10.1088/1361-6587/aeb628}
+}
+```

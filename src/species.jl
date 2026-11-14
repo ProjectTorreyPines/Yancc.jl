@@ -10,13 +10,21 @@ const PROTON_MASS = 1.67262192595e-27
     Species(mass, charge)
 
 Particle species with `mass` in proton masses and `charge` in elementary charges.
-Stored in kg and C.
+Stored in kg and C. The charge may be a dual number, e.g. an average charge state that
+depends on the temperature.
 """
-struct Species
-    mass::Float64
-    charge::Float64
-    Species(mass::Real, charge::Real) = new(mass * PROTON_MASS, charge * ELEMENTARY_CHARGE)
+struct Species{T<:Real}
+    mass::T
+    charge::T
+    function Species(mass::Real, charge::Real)
+        m, q = promote(float(mass) * PROTON_MASS, float(charge) * ELEMENTARY_CHARGE)
+        return new{typeof(m)}(m, q)
+    end
+    Species{T}(mass_kg::Real, charge_C::Real, ::Val{:SI}) where {T} = new{T}(mass_kg, charge_C)
 end
+
+# species of number type `T`, with `f` applied to the mass and the charge
+_convert_species(f, ::Type{T}, s::Species) where {T} = Species{T}(f(s.mass), f(s.charge), Val(:SI))
 
 const Electron = Species(1 / 1836.15267343, -1)
 const Hydrogen = Species(1, 1)
@@ -31,7 +39,7 @@ Maxwellian on one flux surface: `temperature` in eV, `density` in m⁻³ and the
 derivatives with respect to the radial coordinate `rho` of the `Field`.
 """
 struct LocalMaxwellian{T<:Real}
-    species::Species
+    species::Species{T}
     temperature::T
     density::T
     dTdrho::T
@@ -40,9 +48,11 @@ struct LocalMaxwellian{T<:Real}
 end
 
 function LocalMaxwellian(species::Species, temperature::Real, density::Real, dTdrho::Real, dndrho::Real)
-    T, n, dT, dn = promote(float(temperature), float(density), float(dTdrho), float(dndrho))
-    vth = sqrt(2 * T * ELEMENTARY_CHARGE / species.mass)
-    return LocalMaxwellian(species, T, n, dT, dn, vth)
+    T, n, dT, dn, _ = promote(float(temperature), float(density), float(dTdrho), float(dndrho), species.charge)
+    S = typeof(T)
+    sp = _convert_species(S, S, species)
+    vth = sqrt(2 * T * ELEMENTARY_CHARGE / sp.mass)
+    return LocalMaxwellian{S}(sp, T, n, dT, dn, vth)
 end
 
 """

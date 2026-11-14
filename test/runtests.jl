@@ -9,6 +9,7 @@ include(joinpath(@__DIR__, "golden", "layout.jl"))
     include("test_collisions.jl")
     include("test_dke.jl")
     include("test_tokamak.jl")
+    include("test_ad.jl")
     include("test_batch.jl")
     # opt-in: needs an NVIDIA GPU and an environment with CUDA and CUDSS
     if get(ENV, "YANCC_TEST_GPU", "0") == "1"
