@@ -52,6 +52,9 @@ function PreconditionerMaps(op::DKEOperator{Float64}, nl::Integer, speed::Bool, 
     return PreconditionerMaps(Int(nl), planes, coarse, layout, data)
 end
 
+# (not `data`, which belongs to the maps shared by all chunks)
+_free!(P::BatchedTokamakPreconditioner) = (_free!(P.planes); _free!(P.coarse); _free!(P.work))
+
 _assemble(map::AssemblyMap, Θ::AbstractMatrix) = UniformSparseBatch(map.m, map.rowptr, map.colval, map.G * Θ)
 _assemble(map::BlockAssemblyMap, Θ::AbstractMatrix) = _assemble_blocks(map, Θ)
 

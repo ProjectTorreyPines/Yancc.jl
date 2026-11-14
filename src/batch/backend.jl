@@ -41,6 +41,16 @@ _synchronize(::Val) = nothing
 _release(::Val) = nothing
 
 """
+    _free!(x)
+
+Give the device memory of `x` (an array, factors, or a container of them) back now
+rather than at a garbage collection; `x` must not be used afterwards. Nothing to do on
+the host; the device extension adds the methods for its arrays.
+"""
+_free!(x) = nothing
+_free!(x::Union{Tuple,NamedTuple}) = foreach(_free!, x)
+
+"""
 Number of cases to solve at once when the caller does not say; `planes` is the block
 layout of the plane matrices, or `nothing` when they are factored sparse.
 """

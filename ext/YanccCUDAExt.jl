@@ -20,7 +20,7 @@ using LinearAlgebra
 using SparseArrays
 
 import Yancc: _to_device, _default_batchsize, _batched_gemm!, _batched_inverse!, _factor_batch, _solve_batch!, _synchronize, _release,
-    _default_coarse_solver, _default_plane_solver
+    _default_coarse_solver, _default_plane_solver, _free!
 
 function __init__()
     Yancc._DEVICE_FUNCTIONAL[:cuda] = () -> CUDA.functional()
@@ -55,7 +55,10 @@ function _batched_gemm!(tA::Char, tB::Char, α::Real, A::CuStrided3, B::CuStride
 end
 
 _synchronize(::Val{:cuda}) = CUDA.synchronize()
-_release(::Val{:cuda}) = (GC.gc(); CUDA.reclaim(); nothing)
+# The arrays of a chunk are freed one by one (_free!), so a quick collection of the young
+# objects is enough between chunks; a full one took a fifth of a chunk.
+_release(::Val{:cuda}) = (GC.gc(false); nothing)
+_free!(x::CuArray) = CUDA.unsafe_free!(x)
 _default_coarse_solver(::Val{:cuda}) = :block
 # Dense blocks of one pitch angle do more arithmetic than a sparse LU and win on all but
 # small planes: for whole solves on an A100 the two are even at 65 × 41 (2700 unknowns a
@@ -91,6 +94,8 @@ function _factor_batch(::Val{:cuda}, A::Yancc.UniformSparseBatch{<:CuMatrix{Floa
     cudss("factorization", solver, x, b; asynchronous=false)
     return CudssLUBatch(solver, A.m, nbatch)
 end
+
+_free!(F::CudssLUBatch) = (finalize(F.solver.data); nothing)   # the factors live in cuDSS's data
 
 function _solve_batch!(X::CuMatrix{Float64}, F::CudssLUBatch, R::CuMatrix{Float64})
     @assert size(X) == size(R) == (F.m, F.nbatch)

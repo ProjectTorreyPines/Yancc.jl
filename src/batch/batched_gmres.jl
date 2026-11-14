@@ -68,6 +68,7 @@ function gmres_batched!(X::AbstractMatrix{T}, A!, B::AbstractMatrix{T}, M!;
             if j + 1 > size(V, 2)
                 grown = similar(V, n, min(2 * size(V, 2), m + 1), nb)
                 view(grown, :, 1:size(V, 2), :) .= V
+                _free!(V)
                 V = grown
             end
             Vj .= view(V, :, j, :)
@@ -148,5 +149,6 @@ function gmres_batched!(X::AbstractMatrix{T}, A!, B::AbstractMatrix{T}, M!;
         end
     end
     residuals = [bnorm[k] == 0 ? 0.0 : status[k] == :failed ? NaN : Float64(beta[k] / bnorm[k]) for k in 1:nb]
+    foreach(_free!, (V, W, Z, R, Vj, coefficients))   # the Krylov basis is the largest of them
     return (X, iterations, residuals, status)
 end

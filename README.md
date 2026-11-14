@@ -198,19 +198,18 @@ single threaded process per core, 128 in all):
 
 | `nalpha` × `ntheta` | unknowns | one A100 | four A100 | CPU node |
 |---|---|---|---|---|
-| 65 × 41 | 48 000 | 108 | 422 | 69 |
-| 257 × 61 | 282 000 | 13.1 | 51 | 17 |
+| 65 × 41 | 48 000 | 163 | 644 | 69 |
+| 257 × 61 | 282 000 | 18.0 | 72 | 17 |
 
 (1024 and 128 cases per GPU; the cases differ in aspect ratio, safety factor, density,
 temperature and radial electric field and take 6 to 7 iterations each.) The GPU numbers
 leave out the construction of the operators on the host, which takes 1.4 s for 1024
-cases on 32 threads and lowers the first row to about 94 per GPU. With cuDSS for the
-plane matrices instead of blocks the two rows would be 107 and 6.0 solves per second on
-one A100.
+cases on 32 threads and lowers the first row to about 133 per GPU. With cuDSS for the
+plane matrices instead of blocks the second row is about half as fast.
 `benchmark/batch_throughput.jl` and `benchmark/single_throughput.jl` reproduce the
 table; the GPU tests run with `YANCC_TEST_GPU=1`.
 
-Two processes per GPU under CUDA MPS raise the node throughput to 473 and 55 solves
+Two processes per GPU under CUDA MPS raise the node throughput to 743 and 80 solves
 per second for the two rows. Start `nvidia-cuda-mps-control -d` before the processes,
 set `JULIA_CUDA_USE_COMPAT=false`, and give each process a `batchsize` of about 0.8
 times the single-process default.

@@ -66,18 +66,13 @@ function _solve_chunk!(sols, status, seconds, maps, ops, epar, chunk, dev::Val; 
     B = length(cases)
     N, M = prod(state_size(first(cases))), system_size(first(cases))
 
-    # operators, right hand sides and preconditioner matrices, on the host
-    local borders, bop, planes_coarse, rhs
+    # operators, right hand sides and preconditioner matrices
+    local bop, planes_coarse, rhs
     seconds[:assemble] += @elapsed begin
-        borders = Vector{DKEBorder{Float64}}(undef, B)
-        rhs = zeros(M, B)
-        Threads.@threads for b in 1:B
-            borders[b] = DKEBorder(cases[b])
-            rhs[1:N, b] .= vec(dke_rhs(cases[b], epar[chunk[b]]))
-        end
         # the same structure for every chunk, whichever cases have an electric field
         speed = any(op.trajectories.has_speed for op in ops) && first(ops).weights[1] != 0
-        bop = BatchedDKE(cases, borders, dev; speed)
+        bop = BatchedDKE(cases, dev; speed)
+        rhs = _batched_rhs(cases, view(epar, chunk), bop)
         if maps[] === nothing
             t = @elapsed (maps[] = PreconditionerMaps(first(ops), min(Int(moments), bop.nL), speed, dev;
                 coarse_solver, plane_solver))
@@ -98,7 +93,7 @@ function _solve_chunk!(sols, status, seconds, maps, ops, epar, chunk, dev::Val; 
     local Xh, iterations, residuals, stat
     seconds[:iterate] += @elapsed begin
         S = bop.data.scaling
-        Bd = _to_device(dev, rhs)
+        Bd = rhs
         Bd .*= S
         X = fill!(similar(Bd), 0)
         tmp = similar(Bd)
@@ -106,6 +101,8 @@ function _solve_chunk!(sols, status, seconds, maps, ops, epar, chunk, dev::Val; 
         M!(z, v) = (tmp .= v ./ S; _precondition!(z, pre, tmp, bop))
         X, iterations, residuals, stat = gmres_batched!(X, A!, Bd, M!; rtol, restart, maxiter)
         Xh = Array(X)
+        foreach(_free!, (X, Bd, tmp))
+        _free!(pre)   # the device memory of the chunk, now rather than at a garbage collection
     end
 
     seconds[:moments] += @elapsed begin
@@ -115,6 +112,7 @@ function _solve_chunk!(sols, status, seconds, maps, ops, epar, chunk, dev::Val; 
             status[chunk[b]] = stat[b]
         end
     end
+    _free!(bop)
     seconds[:iterate] += @elapsed _solve_failed!(sols, status, ops, epar, chunk[stat.==:failed]; rtol, restart, maxiter)
     return nothing
 end

@@ -148,6 +148,8 @@ struct BlockCoarseFactors{A4,A3,W<:NamedTuple}
     work::W
 end
 
+_free!(F::BlockCoarseFactors) = foreach(f -> _free!(getfield(F, f)), (:Dinv, :Lhat, :U, :Y, :V, :Sinv, :work))
+
 _slice(A::AbstractArray{<:Any,4}, k::Integer) = view(A, :, :, :, k)
 # block T[k, k - d] (lower) or T[k, k + d] (upper) of the band, d ≥ 1
 _band(A::AbstractArray{<:Any,4}, K::Integer, k::Integer, d::Integer) = view(A, :, :, :, k + K * (d - 1))
@@ -278,6 +280,8 @@ function _factor_planes(::Val, planes::NamedTuple)
     return PlaneBlockFactors(planes.na, planes.nt, factors, R, similar(R))
 end
 _factor_planes(device::Val, planes::UniformSparseBatch) = _factor_batch(device, planes)
+
+_free!(F::PlaneBlockFactors) = (_free!(F.factors); _free!(F.R); _free!(F.X))
 
 function _solve_batch!(X::AbstractMatrix, F::PlaneBlockFactors, R::AbstractMatrix)
     na, nt, nplanes = F.na, F.nt, size(R, 2)

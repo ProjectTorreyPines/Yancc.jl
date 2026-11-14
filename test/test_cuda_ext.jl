@@ -27,7 +27,7 @@ else
 
         ops = batch_cases(; Erho=(0.0, 800.0, -1500.0, 300.0))
         borders = [Yancc.DKEBorder(op) for op in ops]
-        host, dev = Yancc.BatchedDKE(ops, borders, Val(:cpu)), Yancc.BatchedDKE(ops, borders, cuda)
+        host, dev = Yancc.BatchedDKE(ops, Val(:cpu)), Yancc.BatchedDKE(ops, cuda)
         hostbatches = Yancc._assemble_preconditioner(Yancc.PreconditionerMaps(ops[1], 4, true, Val(:cpu)), host)
         devbatches = Yancc._assemble_preconditioner(Yancc.PreconditionerMaps(ops[1], 4, true, cuda; coarse_solver=:sparse, plane_solver=:sparse), dev)
         # cuDSS factors without pivoting: close to the host LU, not equal to rounding,
@@ -45,7 +45,7 @@ else
     @testset "CUDA: coarse matrices by dense blocks, $p1" for p1 in ("4z", "4d")
         ops = batch_cases(; Erho=(0.0, 800.0, -1500.0, 300.0), p1, ntheta=13)
         borders = [Yancc.DKEBorder(op) for op in ops]
-        host, dev = Yancc.BatchedDKE(ops, borders, Val(:cpu)), Yancc.BatchedDKE(ops, borders, cuda)
+        host, dev = Yancc.BatchedDKE(ops, Val(:cpu)), Yancc.BatchedDKE(ops, cuda)
         maps = Yancc.PreconditionerMaps(ops[1], 4, true, cuda)
         @test maps.coarse isa Yancc.BlockAssemblyMap   # the default on the device
         blocks = Yancc._assemble_preconditioner(Yancc.PreconditionerMaps(ops[1], 4, true, Val(:cpu); coarse_solver=:block), host)[2]
@@ -60,7 +60,7 @@ else
     @testset "CUDA: plane matrices by dense blocks, $p1, nalpha = $nalpha" for p1 in ("4z", "4d"), nalpha in (17, 16)
         ops = batch_cases(; Erho=(0.0, 800.0, -1500.0, 300.0), p1, nalpha)
         borders = [Yancc.DKEBorder(op) for op in ops]
-        host, dev = Yancc.BatchedDKE(ops, borders, Val(:cpu)), Yancc.BatchedDKE(ops, borders, cuda)
+        host, dev = Yancc.BatchedDKE(ops, Val(:cpu)), Yancc.BatchedDKE(ops, cuda)
         maps = Yancc.PreconditionerMaps(ops[1], 4, true, cuda; plane_solver=:block)
         @test maps.planes isa Yancc.PlaneBlockMap
         # by default only large planes go by blocks on the device
@@ -82,7 +82,7 @@ else
                                                                                                            (((0.0, 0.0, 0.0, 0.0), false), ((0.0, 800.0, -1500.0, 300.0), false), ((0.0, 800.0, 0.0, 0.0), true))
         ops = batch_cases(; Erho, energy_exchange)
         borders = [Yancc.DKEBorder(op) for op in ops]
-        host, dev = Yancc.BatchedDKE(ops, borders, Val(:cpu)), Yancc.BatchedDKE(ops, borders, cuda)
+        host, dev = Yancc.BatchedDKE(ops, Val(:cpu)), Yancc.BatchedDKE(ops, cuda)
         M = Yancc.system_size(ops[1])
         X = reduce(hcat, [test_vector(M) .* (1 + 0.1 * k) .+ 0.01 * k for k in eachindex(ops)])
         Y = Yancc.apply_bordered!(similar(X), host, X)

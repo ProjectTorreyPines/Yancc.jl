@@ -51,13 +51,21 @@ end
                                                                                (((0.0, 0.0, 0.0, 0.0), false), ((0.0, 800.0, -1500.0, 300.0), false), ((0.0, 800.0, 0.0, 0.0), true))
     ops = batch_cases(; Erho, energy_exchange)
     borders = [Yancc.DKEBorder(op) for op in ops]
-    bop = Yancc.BatchedDKE(ops, borders, Val(:cpu))
+    bop = Yancc.BatchedDKE(ops, Val(:cpu))
     M = Yancc.system_size(ops[1])
     X = reduce(hcat, [test_vector(M) .* (1 + 0.1 * k) .+ 0.01 * k for k in eachindex(ops)])
     Y = Yancc.apply_bordered!(similar(X), bop, X)
+    EparB = [0.0, 0.02, -0.01, 0.0]
+    rhs = Yancc._batched_rhs(ops, EparB, bop)
+    N = M - 2 * length(ops[1].species)
     for (k, op) in enumerate(ops)
         y = Yancc.apply_bordered!(zeros(M), op, borders[k], X[:, k])
         @test Y[:, k] ≈ y rtol = 1e-12
+        # the factors formed into constraints, row scalings and drives
+        @test reshape(bop.data.constraints[:, :, k], size(borders[k].constraints)) ≈ borders[k].constraints rtol = 1e-14
+        @test bop.data.scaling[:, k] ≈ Yancc._row_scaling(op, borders[k]) rtol = 1e-13
+        @test rhs[1:N, k] ≈ vec(Yancc.dke_rhs(op, EparB[k])) rtol = 1e-13
+        @test all(iszero, rhs[(N+1):M, k])
     end
     # the matrices of the preconditioner, assembled together from the batched operator
     maps = Yancc.PreconditionerMaps(ops[1], 4, bop.has_speed, Val(:cpu))
@@ -107,7 +115,7 @@ end
 
     ops = batch_cases(; Erho, energy_exchange, p1, ntheta=13)
     borders = [Yancc.DKEBorder(op) for op in ops]
-    bop = Yancc.BatchedDKE(ops, borders, Val(:cpu))
+    bop = Yancc.BatchedDKE(ops, Val(:cpu))
     sparse_maps = Yancc.PreconditionerMaps(ops[1], 4, bop.has_speed, Val(:cpu); coarse_solver=:sparse)
     block_maps = Yancc.PreconditionerMaps(ops[1], 4, bop.has_speed, Val(:cpu); coarse_solver=:block)
     @test block_maps.coarse isa Yancc.BlockAssemblyMap
@@ -144,7 +152,7 @@ end
 
     ops = batch_cases(; p1, nalpha, Erho=(0.0, 800.0, -1500.0, 300.0))
     borders = [Yancc.DKEBorder(op) for op in ops]
-    bop = Yancc.BatchedDKE(ops, borders, Val(:cpu))
+    bop = Yancc.BatchedDKE(ops, Val(:cpu))
     na, nt = nalpha, 11
     h = Yancc._plane_block_layout(ops[1]; points=100).sb ÷ nt   # the reach of the α stencils
     @test h == (p1 == "4z" ? 2 : h) && h >= 2

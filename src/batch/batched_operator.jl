@@ -12,11 +12,15 @@
 # on host arrays and on device arrays.
 
 """
-    BatchedDKE(ops, borders, device; speed)
+    BatchedDKE(ops, device; speed)
 
 The bordered operators of `ops` in the form applied by `apply_bordered!(Y, bop, X)`,
 with their row scalings, on `device` (a `Val`). `speed` keeps the advection in speed
 (default: when a case has a radial electric field).
+
+The constraints and the row scalings are products of factors in pitch angle, θ and
+speed; they are formed on the device from those factors, so that the host only fills
+arrays of the size of the operator coefficients.
 """
 struct BatchedDKE{D<:NamedTuple,W<:NamedTuple}
     dims::NTuple{4,Int}   # nalpha, ntheta, nx, nspecies
@@ -30,6 +34,7 @@ struct BatchedDKE{D<:NamedTuple,W<:NamedTuple}
 end
 
 state_size(bop::BatchedDKE) = bop.dims
+_free!(bop::BatchedDKE) = (_free!(bop.data); _free!(bop.work))
 system_size(bop::BatchedDKE) = prod(bop.dims) + 2 * bop.dims[4]
 
 function _stencil_matrix(st::RowStencil)
@@ -59,7 +64,7 @@ function _check_batch(ops::AbstractVector{<:DKEOperator})
     return nothing
 end
 
-function BatchedDKE(ops::AbstractVector{<:DKEOperator{Float64}}, borders::AbstractVector{<:DKEBorder}, device::Val;
+function BatchedDKE(ops::AbstractVector{<:DKEOperator{Float64}}, device::Val;
     speed::Bool=first(ops).weights[1] != 0 && any(op.trajectories.has_speed for op in ops))
     _check_batch(ops)
     op1 = first(ops)
@@ -78,11 +83,13 @@ function BatchedDKE(ops::AbstractVector{<:DKEOperator{Float64}}, borders::Abstra
     KlocalT, KGHT = zeros(n, n, B), zeros(n, n, nL * B)
     Kexchange = has_exchange ? zeros(n, n, B) : zeros(0, 0, 0)
     S1, S2 = zeros(nx, ns, B), zeros(nx, ns, B)
-    constraints = zeros(np * nx, 2, B)
     sw = zeros(1, nt, 1, B)
-    scaling = zeros(N + 2ns, B)
+    # factors of the constraints and the row scalings
+    xg, wxg, wxig = op1.speedgrid.x, op1.speedgrid.wx, op1.pitchgrid.wxi   # (`wx` is taken: speed advection)
+    dr, root_sw, speed_scale, border_scale = zeros(1, nt, 1, 1, B), zeros(1, nt, 1, 1, B), zeros(1, 1, nx, ns, B), zeros(2ns, B)
+    moments = [sum(xg[i]^2 * wxg[i] * xg[i]^(2(k - 1)) for i in 1:nx) for k in 1:2]
     Threads.@threads for b in 1:B
-        op, border = ops[b], borders[b]
+        op = ops[b]
         tr, col = op.trajectories, op.collisions
         cols = (1:n) .+ n * (b - 1)
         wa[:, cols] .= w[2] .* reshape(tr.wa, np, n)
@@ -95,11 +102,20 @@ function BatchedDKE(ops::AbstractVector{<:DKEOperator{Float64}}, borders::Abstra
             KGHT[:, :, l+nL*(b-1)] .= transpose(view(col.KGH, :, :, l))
         end
         has_exchange && (Kexchange[:, :, b] .= col.Kexchange)
-        S1[:, :, b] .= view(border.sources, :, :, 1)
-        S2[:, :, b] .= view(border.sources, :, :, 2)
-        constraints[:, :, b] .= reshape(border.constraints, np * nx, 2)
+        drb = vec(volume_element(op.field))
+        dr[1, :, 1, 1, b] .= drb
         sw[1, :, 1, b] .= vec(op.surface_weights)
-        scaling[:, b] .= _row_scaling(op, border)
+        root_sw[1, :, 1, 1, b] .= sqrt.(vec(op.surface_weights))
+        for (s, sp) in enumerate(op.species)
+            for i in 1:nx
+                F = sp(xg[i] * sp.v_thermal)
+                S1[i, s, b], S2[i, s, b] = (xg[i]^2 - 5 / 2) * F, (-2 / 3 * xg[i]^2 + 1) * F   # as in DKEBorder
+                speed_scale[1, 1, i, s, b] = sqrt(exp(-xg[i]^2) * xg[i]^2 * wxg[i]) / F         # as in _row_scaling
+            end
+            for k in 1:2
+                border_scale[2(s-1)+k, b] = 1 / (4π^2 * sum(wxig) * sum(drb) * moments[k] * sp(0.0))
+            end
+        end
     end
 
     # (names distinct from those of the threaded loop above, which must stay local to it)
@@ -107,6 +123,14 @@ function BatchedDKE(ops::AbstractVector{<:DKEOperator{Float64}}, borders::Abstra
     It, Ia = sparse(1.0I, nt, nt), sparse(1.0I, na, na)
     dev(A) = _to_device(device, A)
     DxT = has_speed ? repeat(Matrix(transpose(kron(Matrix(1.0I, ns, ns), tr1.Dx))), 1, 1, B) : zeros(0, 0, 0)
+    # constraints[α, θ, x, k, b] = 4π² wxig[α] dr[θ] x² wx x^(2(k-1)) (DKEBorder), and the
+    # row scalings of _row_scaling, from their factors on the device
+    pitch = dev(reshape(4π^2 .* wxig, na, 1, 1, 1, 1))
+    speedk = dev(reshape([xg[i]^2 * wxg[i] * xg[i]^(2(k - 1)) for i in 1:nx, k in 1:2], 1, 1, nx, 2, 1))
+    constraints = reshape(pitch .* dev(dr) .* speedk, np * nx, 2, B)
+    scaling = similar(constraints, N + 2ns, B)
+    view(scaling, 1:N, :) .= reshape(dev(reshape(sqrt.(wxig), na, 1, 1, 1, 1)) .* dev(root_sw) .* dev(speed_scale), N, B)
+    view(scaling, (N+1):(N+2ns), :) .= dev(border_scale)
     data = (
         # common to all cases: derivative along α and θ with either stencil, pitch
         # angle scattering, Legendre transform
@@ -117,7 +141,7 @@ function BatchedDKE(ops::AbstractVector{<:DKEOperator{Float64}}, borders::Abstra
         # per case
         wa=dev(wa), wt=dev(wt), wx=dev(wx), nuscale=dev(nuscale), shift=dev(shift), DxT=dev(DxT),
         KlocalT=dev(KlocalT), KGHT=dev(KGHT), Kexchange=dev(Kexchange),
-        S1=dev(S1), S2=dev(S2), constraints=dev(constraints), sw=dev(sw), scaling=dev(scaling))
+        S1=dev(S1), S2=dev(S2), constraints, sw=dev(sw), scaling)
 
     like(dims...) = similar(data.wa, dims...)
     work = (F=like(np, nB), O=like(np, nB), T=like(np, nB), T2=like(np, nB), mean=like(1, nt * nB),
@@ -190,4 +214,39 @@ function apply_bordered!(Y::AbstractMatrix, bop::BatchedDKE, X::AbstractMatrix)
     view(Y, 1:N, :) .= reshape(O, N, B)
     view(Y, (N+1):(N+2ns), :) .= w.con
     return Y
+end
+
+"""
+    _batched_rhs(ops, EparB, bop)
+
+Right hand sides of the bordered systems of `ops` ([`dke_rhs`](@ref) and zero for the
+constraints), one column per case, on the device of `bop`. The drive is a sum of two
+products of factors in pitch angle, θ and speed, formed on the device.
+"""
+function _batched_rhs(ops::AbstractVector{<:DKEOperator{Float64}}, EparB::AbstractVector{<:Real}, bop::BatchedDKE)
+    na, nt, nx, ns = bop.dims
+    B, N = bop.nbatch, prod(bop.dims)
+    op1 = first(ops)
+    xi, x = op1.pitchgrid.xi, op1.speedgrid.x
+    # drive = c1[x, s] (1 + ξ²) BxgradB/(2B³)[θ] + c2[x, s] ξ B[θ], see dke_rhs and
+    # radial_magnetic_drift: -(A1 + x² A2) v_m·∇ρ F_M + A3 B v∥ F_M
+    c1, c2 = zeros(1, 1, nx, ns, B), zeros(1, 1, nx, ns, B)
+    h1, h2 = zeros(1, nt, 1, 1, B), zeros(1, nt, 1, 1, B)
+    Threads.@threads for b in 1:B
+        op = ops[b]
+        field = op.field
+        h1[1, :, 1, 1, b] .= vec(field.BxgradrhodotgradB) ./ (2 .* vec(field.Bmag) .^ 3)
+        h2[1, :, 1, 1, b] .= vec(field.Bmag)
+        for (s, (sp, (A1, A2, A3))) in enumerate(zip(op.species, thermodynamic_forces(op, EparB[b]))), i in 1:nx
+            v = x[i] * sp.v_thermal
+            F = sp(v)
+            c1[1, 1, i, s, b] = (A1 + x[i]^2 * A2) * sp.species.mass * v^2 / sp.species.charge * F
+            c2[1, 1, i, s, b] = A3 * v * F
+        end
+    end
+    like(A) = _like(bop.data.scaling, A)
+    R = fill!(similar(bop.data.scaling, N + 2ns, B), 0)
+    view(R, 1:N, :) .= reshape(like(reshape(1 .+ xi .^ 2, na, 1, 1, 1, 1)) .* like(h1) .* like(c1) .+
+                               like(reshape(collect(xi), na, 1, 1, 1, 1)) .* like(h2) .* like(c2), N, B)
+    return R
 end
