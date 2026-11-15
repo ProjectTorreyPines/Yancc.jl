@@ -15,12 +15,16 @@
 # between speeds through energy scattering and the field particle operator.
 
 """
-    plane_matrix(op, i, s)
+    plane_matrix(op, i, s; uniform=false)
 
 Sparse matrix on the `(α, θ)` plane of speed node `i` and species `s`: advection in θ
 and α, pitch angle scattering, and the diagonal of the terms that couple speeds.
+
+With `uniform = true` the entries of both the forward and the backward stencil are
+stored at every node, those of the unused one as zeros, so that the sparsity pattern
+depends on the grids and stencils only (the same for every speed, species and case).
 """
-function plane_matrix(op::DKEOperator{Float64}, i::Integer, s::Integer)
+function plane_matrix(op::DKEOperator{Float64}, i::Integer, s::Integer; uniform::Bool=false)
     na, nt, nz, nx, ns = state_size(op)
     @assert nz == 1
     tr, col, w = op.trajectories, op.collisions, op.weights
@@ -32,14 +36,22 @@ function plane_matrix(op::DKEOperator{Float64}, i::Integer, s::Integer)
     for t in 1:nt, a in 1:na
         r = idx(a, t)
         wind = tr.wt[a, t, 1, i, s]
-        st = wind > 0 ? tr.Dt[2] : tr.Dt[1]
-        for k in st.ptr[t]:(st.ptr[t+1]-1)
-            push!(rows, r), push!(cols, idx(a, st.idx[k])), push!(vals, w[3] * wind * st.val[k])
+        for d in 1:2
+            upwind = (wind > 0) == (d == 2)
+            upwind || uniform || continue
+            st = tr.Dt[d]
+            for k in st.ptr[t]:(st.ptr[t+1]-1)
+                push!(rows, r), push!(cols, idx(a, st.idx[k])), push!(vals, upwind ? w[3] * wind * st.val[k] : 0.0)
+            end
         end
         wind = tr.wa[a, t, 1, i, s]
-        st = wind > 0 ? tr.Da[2] : tr.Da[1]
-        for k in st.ptr[a]:(st.ptr[a+1]-1)
-            push!(rows, r), push!(cols, idx(st.idx[k], t)), push!(vals, w[2] * wind * st.val[k])
+        for d in 1:2
+            upwind = (wind > 0) == (d == 2)
+            upwind || uniform || continue
+            st = tr.Da[d]
+            for k in st.ptr[a]:(st.ptr[a+1]-1)
+                push!(rows, r), push!(cols, idx(st.idx[k], t)), push!(vals, upwind ? w[2] * wind * st.val[k] : 0.0)
+            end
         end
         for a2 in 1:na
             col.D[a, a2] == 0 && continue
@@ -103,13 +115,18 @@ struct MomentCoarseSpace{F}
 end
 
 """
-    moment_coarse_matrix(op, border, nl)
+    moment_coarse_matrix(op, border, nl; uniform=false, speed=op.trajectories.has_speed)
 
 Galerkin projection of the bordered operator on the first `nl` Legendre moments at
 every `(θ, x, s)`: unknowns `c[l, j, θ]` at index `(θ-1) nl n + (l-1) n + j` with
 `j = i + nx (s-1)`, then the surface averages of `c[1, j, θ]`, then the sources.
+
+With `uniform = true` entries that happen to vanish are stored as zeros, so that the
+sparsity pattern depends on the grids and stencils only; `speed` then says whether the
+pattern holds the speed term (needed when any case of a batch has an electric field).
 """
-function moment_coarse_matrix(op::DKEOperator{Float64}, border::DKEBorder, nl::Integer)
+function moment_coarse_matrix(op::DKEOperator{Float64}, border::DKEBorder, nl::Integer; uniform::Bool=false,
+    speed::Bool=op.trajectories.has_speed)
     na, nt, nz, nx, ns = state_size(op)
     tr, col, w = op.trajectories, op.collisions, op.weights
     n = nx * ns
@@ -148,7 +165,7 @@ function moment_coarse_matrix(op::DKEOperator{Float64}, border::DKEBorder, nl::I
                     end
                 end
                 for k in st.ptr[t]:(st.ptr[t+1]-1), lp in 1:nl, l in 1:nl
-                    blk[lp, l] == 0 || add(cidx(lp, t, j), cidx(l, st.idx[k], j), blk[lp, l] * st.val[k])
+                    (uniform || blk[lp, l] != 0) && add(cidx(lp, t, j), cidx(l, st.idx[k], j), blk[lp, l] * st.val[k])
                 end
             end
             # mirror term and pitch angle scattering
@@ -162,10 +179,10 @@ function moment_coarse_matrix(op::DKEOperator{Float64}, border::DKEBorder, nl::I
             end
             blk .-= col.weights[1] * col.nus[i, s] / 2 .* WDP
             for lp in 1:nl, l in 1:nl
-                blk[lp, l] == 0 || add(cidx(lp, t, j), cidx(l, t, j), blk[lp, l])
+                (uniform || blk[lp, l] != 0) && add(cidx(lp, t, j), cidx(l, t, j), blk[lp, l])
             end
             # speed term
-            if tr.has_speed && w[1] != 0
+            if speed && w[1] != 0
                 for ip in 1:nx
                     fill!(blk, 0)
                     for a in 1:na, lp in 1:nl, l in 1:nl
@@ -191,12 +208,12 @@ function moment_coarse_matrix(op::DKEOperator{Float64}, border::DKEBorder, nl::I
     # terms coupling speeds and species, local in θ
     for t in 1:nt, l in 1:nl, lp in 1:nl, j in 1:n, jp in 1:n
         v = M[lp, l] * (col.Klocal[jp, j] + col.KGH[jp, j, l] + (jp == j ? w[8] : 0.0))
-        v == 0 || add(cidx(lp, t, jp), cidx(l, t, j), v)
+        (uniform || v != 0) && add(cidx(lp, t, jp), cidx(l, t, j), v)
     end
     if !isempty(col.exchange)
         for t in 1:nt, lp in 1:nl, j in 1:n, jp in 1:n
             v = M[lp, 1] * col.Kexchange[jp, j]
-            v == 0 || add(cidx(lp, t, jp), aux(j), v)
+            (uniform || v != 0) && add(cidx(lp, t, jp), aux(j), v)
         end
     end
     return sparse(rows, cols, vals, nc, nc), P, W
