@@ -1,0 +1,4 @@
+# The GPU extension needs an NVIDIA GPU, which CI does not have; its tests run with
+# YANCC_TEST_GPU=1 on a machine that has one.
+ignore:
+  - "ext/YanccCUDAExt.jl"

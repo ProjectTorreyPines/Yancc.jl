@@ -35,7 +35,10 @@ jobs:
 
       - uses: julia-actions/julia-buildpkg@v1
 
+      # two threads, so that the threaded loops over cases are run
       - uses: julia-actions/julia-runtest@v1
+        env:
+          JULIA_NUM_THREADS: 2
 
       - uses: julia-actions/julia-processcoverage@v1
 
