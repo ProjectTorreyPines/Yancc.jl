@@ -35,3 +35,10 @@ asd.jl
 
 # Ignore compiled object files
 *.o
+
+# rules, development record, scripts and NEO reference runs of the rotation model: kept in the
+# maintainer's checkout, not distributed (the tests need only test/golden/rotation.npz)
+/CLAUDE.md
+/development_notes/
+/scripts/
+/test/golden/neo/

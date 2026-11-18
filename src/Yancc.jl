@@ -17,6 +17,7 @@ include("velocity_grids.jl")
 include("species.jl")
 include("field.jl")
 include("rosenbluth.jl")
+include("rotation.jl")
 include("collisions.jl")
 include("trajectories.jl")
 include("operators.jl")
@@ -30,6 +31,7 @@ export LocalMaxwellian, from_scale_lengths
 export Field, field_from_boozer, flux_surface_average
 export MaxwellSpeedGrid, UniformPitchAngleGrid
 export DKEOperator, DKESolution, solve_dke_reference, conductive_heat_flux
+export Rotation, RotatingEquilibrium, energy_flux, nondissipative_fluxes
 export solve_dke_tokamak, solve_dke_tokamak!, TokamakPreconditioner, TokamakCache
 
 end

@@ -6,6 +6,13 @@
 #   dα/dt = -v sinα b·∇B/(2B) - E_ρ ξ sinα (B×∇ρ·∇B)/(2B³)
 #   dx/dt = -E_ρ (1+ξ²) x (B×∇ρ·∇B)/(2B³)
 #
+# With toroidal rotation the potential energy T_s λ_s(θ) of the rotating frame (rotation.jl)
+# accelerates the particles along the field, m dv∥/dt = -μ b·∇B - T b·∇λ, which adds
+#
+#   dα/dt = -v_th sinα b·∇λ/(2x),   dx/dt = -v_th ξ b·∇λ/2
+#
+# (Belli & Candy, Phys. Plasmas 25, 032301 (2018), eq 29; Belli, Candy & Angioni 2014, eqs 25-27).
+#
 # Each is discretized with upwinded finite differences, the direction chosen node by
 # node from the sign of the advection speed.
 
@@ -36,7 +43,7 @@ end
 Advection speeds `wt, wz, wa, wx[α, θ, ζ, x, s]` of the four phase space coordinates
 and the forward/backward difference stencils in θ, ζ and α. `Erho = -∂Φ/∂ρ` [V].
 `p1` names the first derivative stencil; `p1_theta`, `p1_zeta` and `p1_alpha` override
-it for one coordinate.
+it for one coordinate. `rotation` is the [`RotatingEquilibrium`](@ref) of a rotating plasma.
 """
 struct Trajectories{T}
     wt::Array{T,5}
@@ -52,7 +59,8 @@ end
 
 function Trajectories(field::Field, pitchgrid::UniformPitchAngleGrid, speedgrid::MaxwellSpeedGrid,
     species::AbstractVector{<:LocalMaxwellian{T}}, Erho::Real; p1::AbstractString=DEFAULT_P1,
-    p1_theta::AbstractString=p1, p1_zeta::AbstractString=p1, p1_alpha::AbstractString=p1) where {T}
+    p1_theta::AbstractString=p1, p1_zeta::AbstractString=p1, p1_alpha::AbstractString=p1,
+    rotation::Union{Nothing,RotatingEquilibrium}=nothing) where {T}
 
     na, nt, nz, nx, ns = pitchgrid.nalpha, field.ntheta, field.nzeta, speedgrid.nx, length(species)
     half(p) = length(FD_COEFFS_1[p]) ÷ 2
@@ -60,7 +68,7 @@ function Trajectories(field::Field, pitchgrid::UniformPitchAngleGrid, speedgrid:
     @assert na > half(p1_alpha) "nalpha must exceed $(half(p1_alpha)) for stencil $p1_alpha"
     @assert nz == 1 || nz > half(p1_zeta) "nzeta must be 1 or exceed $(half(p1_zeta)) for stencil $p1_zeta"
 
-    S = promote_type(T, typeof(float(Erho)))
+    S = promote_type(T, typeof(float(Erho)), rotation === nothing ? T : typeof(rotation.omega))
     wt, wz, wa, wx = (zeros(S, na, nt, nz, nx, ns) for _ in 1:4)
     B = field.Bmag
     for s in 1:ns, i in 1:nx, z in 1:nz, t in 1:nt, a in 1:na
@@ -73,6 +81,11 @@ function Trajectories(field::Field, pitchgrid::UniformPitchAngleGrid, speedgrid:
         wz[a, t, z, i, s] = field.B_sup_z[t, z] / B[t, z] * v * xi - field.B_sub_t[t, z] * exb
         wa[a, t, z, i, s] = -field.bdotgradB[t, z] / (2 * B[t, z]) * sina * v + xi * sina * drift
         wx[a, t, z, i, s] = (1 + xi^2) * speedgrid.x[i] * drift
+        if rotation !== nothing
+            force = -field.B_sup_t[t, z] / B[t, z] * species[s].v_thermal * rotation.dlambda[t, s] / 2
+            wa[a, t, z, i, s] += sina * force / speedgrid.x[i]
+            wx[a, t, z, i, s] += xi * force
+        end
     end
 
     ht, hz, ha = 2π / nt, 2π / nz / field.NFP, π / na
@@ -80,7 +93,7 @@ function Trajectories(field::Field, pitchgrid::UniformPitchAngleGrid, speedgrid:
     Dt = stencils(p1_theta, nt, ht, :periodic)
     Dz = nz > 1 ? stencils(p1_zeta, nz, hz, :periodic) : (RowStencil(zeros(1, 1)), RowStencil(zeros(1, 1)))
     Da = stencils(p1_alpha, na, ha, :symmetric)
-    return Trajectories{S}(wt, wz, wa, wx, !iszero(Erho), Dt, Dz, Da, speedgrid.Dx)
+    return Trajectories{S}(wt, wz, wa, wx, !iszero(Erho) || rotation !== nothing, Dt, Dz, Da, speedgrid.Dx)
 end
 
 # out += weight * w * (upwinded derivative of f along dimension dim)

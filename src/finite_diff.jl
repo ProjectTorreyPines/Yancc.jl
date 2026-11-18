@@ -1,6 +1,9 @@
 # Finite difference stencils on uniform grids (yancc/_finite_diff.py).
 
 const DEFAULT_P1 = "4d"
+# With `rotation` the centred stencil is the default: the upwind one is far from converged at
+# practical poloidal resolutions in collisional rotating plasmas.
+const DEFAULT_P1_ROTATION = "4z"
 const DEFAULT_P2 = 4
 
 # First derivative, forward-biased, reference point at the centre of the stencil.

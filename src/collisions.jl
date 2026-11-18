@@ -44,9 +44,10 @@ end
 `M[y, x, s]`: energy scattering `C_E` of species `s` acting on node values in speed,
 summed over all field species and background Maxwellians. Galerkin discretization of
 the flux form `C_E f = x⁻² ∂/∂x [a (f' + 2 τ x f)]`, `a = ν∥ x⁴/2`, `τ = T_a/T_b`.
+`density_factors` scale the densities of the field species (kinetic, then background).
 """
 function energy_scattering_matrices(speedgrid::MaxwellSpeedGrid, species::AbstractVector{<:LocalMaxwellian{T}},
-    background::AbstractVector, lnlambda) where {T}
+    background::AbstractVector, lnlambda; density_factors=nothing) where {T}
     nx, ns = speedgrid.nx, length(species)
     x = speedgrid.x
     Vp, dVp = maxwell_vandermonde(x, nx)
@@ -56,8 +57,9 @@ function energy_scattering_matrices(speedgrid::MaxwellSpeedGrid, species::Abstra
     for (s, spa) in enumerate(species)
         diffusion = zeros(T, nx)
         relaxation = zeros(T, nx)
-        for spb in Iterators.flatten((species, background)), i in 1:nx
+        for (b, spb) in enumerate(Iterators.flatten((species, background))), i in 1:nx
             a = nupar_ab(spa, spb, x[i] * spa.v_thermal, lnlambda) * x[i]^4 / 2
+            density_factors === nothing || (a *= density_factors[b])
             tau = spa.temperature / spb.temperature
             diffusion[i] += a
             relaxation[i] += 2 * (tau - 1) * a * x[i]
@@ -67,6 +69,47 @@ function energy_scattering_matrices(speedgrid::MaxwellSpeedGrid, species::Abstra
         M[:, :, s] .= speedgrid.xvander * modal * speedgrid.xvander_inv
     end
     return M
+end
+
+"""
+    RotatingCollisions
+
+Collision operator of a rotating plasma, linearized about the Maxwellians of the local
+densities `n_s(θ)`: the test particle terms of species `a` scale with the densities of the
+field species, its field particle terms with its own (Belli, Candy & Angioni 2014, eq 11,
+with `f_0a ∝ n_0a(θ)`).
+
+  - `nus[x, s, θ]`, `Klocal[:, :, θ]`, `KGH[:, :, l, θ]`: as in [`CollisionOperator`](@ref), at each poloidal node
+  - `V[:, k, θ]`, `M[k, :, θ]`: for each species the density and the temperature
+    perturbation of its Maxwellian, which the collisionless operator annihilates, as
+    isotropic functions on the (speed, species) index, and the moments dual to them under
+    the flux surface average (`k = s` density, `k = ns + s` energy)
+  - `A[:, k, θ]`: the functions that carry the correction, with `⟨M A⟩ = 1`: for the density
+    `V` itself, for the energy `(x² - 3/2)` times the local Maxwellian, which holds no
+    particles at any point of the surface
+  - `KV`, `MK`, `G`: `K0 V`, `M K0` and the surface average of `M K0 V`, with `K0` the
+    isotropic block of the operator; they form the correction
+    `X = -A ⟨M K0 ·⟩ - K0 V ⟨M ·⟩ + A G ⟨M ·⟩` that removes the surface averaged exchange
+    of density and energy between species (empty when `energy_exchange = true`)
+
+`(K0 + X) V = 0` and `⟨M (K0 + X) ·⟩ = 0` for any `A` with `⟨M A⟩ = 1`. With `A = V` the
+correction is `(I - P) K0 (I - P) - K0`, `P = V ⟨M ·⟩`, that of the operator without
+rotation. In a rotating plasma the temperature perturbation in `V` changes the density
+along the surface, and a correction carried by it would move particles between major
+radii without their angular momentum: a torque, and a flux of charge. The choice above
+conserves particles at every point and with them the angular momentum; without rotation
+the two coincide.
+"""
+struct RotatingCollisions{T}
+    nus::Array{T,3}
+    Klocal::Array{T,3}
+    KGH::Array{T,4}
+    V::Array{T,3}
+    M::Array{T,3}
+    A::Array{T,3}
+    KV::Array{T,3}
+    MK::Array{T,3}
+    G::Matrix{T}
 end
 
 """
@@ -85,7 +128,11 @@ Discrete linearized Fokker-Planck operator for the kinetic `species`, with addit
     density and energy between species (empty when `energy_exchange = true`)
 
 `weights` scale `(C_L, C_E, C_F)`. `lnlambda = nothing` uses pairwise Coulomb
-logarithms.
+logarithms, those of the densities at the reference point in a rotating plasma.
+
+With `rotation` (a [`RotatingEquilibrium`](@ref)) and the normalized `surface_weights[θ]`
+of the flux surface average, the fields above are those of the reference point and
+`rotating` holds the operator at each poloidal node, see [`RotatingCollisions`](@ref).
 """
 struct CollisionOperator{T}
     nL::Int
@@ -102,13 +149,17 @@ struct CollisionOperator{T}
     Klocal::Matrix{T}       # -(w_E C_E + w_F CD)
     KGH::Array{T,3}         # -w_F GH per Legendre mode
     Kexchange::Matrix{T}
+    rotating::Union{Nothing,RotatingCollisions{T}}
 end
+CollisionOperator{T}(nL, weights, nus, D, CE, CD, GH, Txi, Txi_inv, exchange, Klocal, KGH, Kexchange) where {T} =
+    CollisionOperator{T}(nL, weights, nus, D, CE, CD, GH, Txi, Txi_inv, exchange, Klocal, KGH, Kexchange, nothing)
 
 function CollisionOperator(pitchgrid::UniformPitchAngleGrid, speedgrid::MaxwellSpeedGrid,
     species::AbstractVector{<:LocalMaxwellian{T}};
     background::AbstractVector=LocalMaxwellian{T}[], nL::Integer=8, p2::Integer=DEFAULT_P2, lnlambda=nothing,
     weights=(1.0, 1.0, 1.0), energy_exchange::Bool=false,
-    potentials::RosenbluthPotentials=RosenbluthPotentials(speedgrid, species, nL)) where {T}
+    potentials::RosenbluthPotentials=RosenbluthPotentials(speedgrid, species, nL),
+    rotation::Union{Nothing,RotatingEquilibrium}=nothing, surface_weights=nothing) where {T}
 
     nx, ns = speedgrid.nx, length(species)
     x = speedgrid.x
@@ -166,7 +217,72 @@ function CollisionOperator(pitchgrid::UniformPitchAngleGrid, speedgrid::MaxwellS
         Kexchange = species_exchange_correction(speedgrid, species, Klocal .+ KGH[:, :, 1])
         exchange = permutedims(reshape(Kexchange, nx, ns, nx, ns), (1, 3, 2, 4))
     end
-    return CollisionOperator{T}(nL, (wL, wE, wF), nus, D, CE, CD, GH, Txi, Txi_inv, exchange, Klocal, KGH, Kexchange)
+    rotating = rotation === nothing ? nothing :
+               RotatingCollisions(speedgrid, species, background, lnlambda, (wL, wE, wF), CD, GH, rotation, vec(surface_weights), energy_exchange)
+    return CollisionOperator{T}(nL, (wL, wE, wF), nus, D, CE, CD, GH, Txi, Txi_inv, exchange, Klocal, KGH, Kexchange, rotating)
+end
+
+function RotatingCollisions(speedgrid::MaxwellSpeedGrid, species::AbstractVector{<:LocalMaxwellian{T}}, background::AbstractVector,
+    lnlambda, weights, CD::Array{T,4}, GH::Array{T,5}, eq::RotatingEquilibrium, sw::AbstractVector, energy_exchange::Bool) where {T}
+    nx, ns, nL = speedgrid.nx, length(species), size(GH, 2)
+    nt = size(eq.density, 1)
+    x = speedgrid.x
+    wL, wE, wF = weights
+    n = nx * ns
+    idx(i, s) = i + nx * (s - 1)
+    nus = zeros(T, nx, ns, nt)
+    Klocal = zeros(T, n, n, nt)
+    KGH = zeros(T, n, n, nL, nt)
+    for t in 1:nt
+        factors = vcat(eq.density[t, :], eq.bg_density[t, :])
+        for (s, spa) in enumerate(species), (b, spb) in enumerate(Iterators.flatten((species, background))), i in 1:nx
+            nus[i, s, t] += factors[b] * nuD_ab(spa, spb, x[i] * spa.v_thermal, lnlambda)
+        end
+        CE = energy_scattering_matrices(speedgrid, species, background, lnlambda; density_factors=factors)
+        for b in 1:ns, a in 1:ns, j in 1:nx, i in 1:nx
+            Klocal[idx(i, a), idx(j, b), t] = -wF * factors[a] * CD[i, j, a, b] - (a == b ? wE * CE[i, j, a] : zero(T))
+            for l in 1:nL
+                KGH[idx(i, a), idx(j, b), l, t] = -wF * factors[a] * GH[i, l, j, a, b]
+            end
+        end
+    end
+    none = zeros(T, 0, 0, 0)
+    energy_exchange && return RotatingCollisions{T}(nus, Klocal, KGH, none, none, none, none, none, zeros(T, 0, 0))
+
+    # density and temperature perturbations of each Maxwellian, functions of the energy
+    # x² + λ_s(θ) alone, and the moments dual to them
+    wv = x .^ 2 .* speedgrid.wx
+    V = zeros(T, n, 2ns, nt)
+    M = zeros(T, 2ns, n, nt)
+    A = zeros(T, n, 2ns, nt)
+    for (s, sp) in enumerate(species)
+        F = sp.(x .* sp.v_thermal)
+        fhat = F ./ sum(wv .* F)
+        d, lam = view(eq.density, :, s), view(eq.lambda, :, s)
+        dbar = sum(sw .* d)
+        a = sum(sw[t] * d[t] * (sum(wv .* x .^ 2 .* fhat) + lam[t]) for t in 1:nt) / dbar
+        norm = sum(sw[t] * d[t] * sum(wv .* (x .^ 2 .+ lam[t] .- a) .^ 2 .* F) for t in 1:nt)
+        b = sum(wv .* x .^ 2 .* fhat)   # 3/2 with the quadrature of the grid
+        normA = sum(sw[t] * d[t] * sum(wv .* (x .^ 2 .+ lam[t] .- a) .* (x .^ 2 .- b) .* F) for t in 1:nt)
+        for t in 1:nt, i in 1:nx
+            V[idx(i, s), s, t] = d[t] * fhat[i] / dbar
+            V[idx(i, s), ns+s, t] = (x[i]^2 + lam[t] - a) * d[t] * F[i] / norm
+            M[s, idx(i, s), t] = wv[i]
+            M[ns+s, idx(i, s), t] = wv[i] * (x[i]^2 + lam[t] - a)
+            A[idx(i, s), s, t] = V[idx(i, s), s, t]
+            A[idx(i, s), ns+s, t] = (x[i]^2 - b) * d[t] * F[i] / normA
+        end
+    end
+    KV = zeros(T, n, 2ns, nt)
+    MK = zeros(T, 2ns, n, nt)
+    G = zeros(T, 2ns, 2ns)
+    for t in 1:nt
+        K0 = Klocal[:, :, t] .+ KGH[:, :, 1, t]
+        KV[:, :, t] .= K0 * V[:, :, t]
+        MK[:, :, t] .= M[:, :, t] * K0
+        G .+= sw[t] .* (M[:, :, t] * KV[:, :, t])
+    end
+    return RotatingCollisions{T}(nus, Klocal, KGH, V, M, A, KV, MK, G)
 end
 
 """
@@ -211,6 +327,7 @@ normalized flux surface average weights.
 """
 function apply_collisions!(out::AbstractArray{<:Any,5}, C::CollisionOperator, f::AbstractArray{<:Any,5},
     surface_weights::AbstractMatrix)
+    C.rotating === nothing || return _apply_rotating_collisions!(out, C, C.rotating, f, surface_weights)
     na, nt, nz, nx, ns = size(f)
     wL = C.weights[1]
     nr = nt * nz
@@ -264,6 +381,71 @@ function apply_collisions!(out::AbstractArray{<:Any,5}, C::CollisionOperator, f:
         d = C.Kexchange * c
         @inbounds for j in 1:n
             @views O2[:, :, j] .+= C.Txi[:, 1] .* d[j]
+        end
+    end
+    return out
+end
+
+# The same for a rotating plasma, with the operator of each poloidal node (nzeta = 1).
+function _apply_rotating_collisions!(out::AbstractArray{<:Any,5}, C::CollisionOperator, R::RotatingCollisions, f::AbstractArray{<:Any,5},
+    surface_weights::AbstractMatrix)
+    na, nt, nz, nx, ns = size(f)
+    @assert nz == 1
+    wL = C.weights[1]
+    n = nx * ns
+    F = reshape(f, na, nt, n)
+    O = reshape(out, na, nt, n)
+
+    # terms local in pitch angle
+    @inbounds for t in 1:nt
+        @views mul!(O[:, t, :], F[:, t, :], transpose(R.Klocal[:, :, t]), true, true)
+    end
+
+    # pitch angle scattering
+    D = C.D
+    band = maximum(abs(a - b) for b in 1:na, a in 1:na if D[a, b] != 0; init=0)
+    g = Vector{eltype(f)}(undef, na)
+    @inbounds for j in 1:n, t in 1:nt
+        scale = -wL * R.nus[j+(t-1)*n] / 2
+        mean = zero(eltype(f))
+        for a in 1:na
+            mean += F[a, t, j]
+        end
+        mean /= na
+        for a in 1:na
+            g[a] = F[a, t, j] - mean
+        end
+        for a in 1:na
+            acc = zero(eltype(f))
+            for b in max(1, a - band):min(na, a + band)
+                acc += D[a, b] * g[b]
+            end
+            O[a, t, j] += scale * acc
+        end
+    end
+
+    # Rosenbluth potential part
+    Fm = reshape(C.Txi_inv * reshape(f, na, nt * n), C.nL, nt, n)
+    Y = similar(Fm, eltype(out))
+    @inbounds for t in 1:nt, l in 1:C.nL
+        @views mul!(Y[l, t, :], R.KGH[:, :, l, t], Fm[l, t, :])
+    end
+    mul!(reshape(out, na, nt * n), C.Txi, reshape(Y, C.nL, nt * n), true, true)
+
+    # exchange between species
+    if !isempty(R.V)
+        m = zeros(eltype(out), size(R.M, 1))
+        u = zeros(eltype(out), size(R.M, 1))
+        @inbounds for t in 1:nt
+            @views mul!(m, R.M[:, :, t], Fm[1, t, :], surface_weights[t, 1], true)
+            @views mul!(u, R.MK[:, :, t], Fm[1, t, :], surface_weights[t, 1], true)
+        end
+        u .= R.G * m .- u
+        @inbounds for t in 1:nt
+            d = @views R.A[:, :, t] * u .- R.KV[:, :, t] * m
+            for j in 1:n
+                @views O[:, t, j] .+= C.Txi[:, 1] .* d[j]
+            end
         end
     end
     return out

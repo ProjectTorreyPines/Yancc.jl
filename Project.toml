@@ -1,6 +1,6 @@
 name = "Yancc"
 uuid = "e33992e4-cc39-4722-8100-d5327085430f"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Tom Neiser <neisert@fusion.gat.com>"]
 
 [deps]

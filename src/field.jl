@@ -31,6 +31,12 @@ Keywords: `Psi` (toroidal flux through the last closed surface [Wb]), `iota`,
 `R_major`, `a_minor` (used for diagnostics and normalizations only, estimated from the
 field when omitted), `NFP`, `dBdt`, `dBdz` (angular derivatives of `|B|`, spectral by
 default) and `B0`.
+
+Toroidal rotation (see [`Rotation`](@ref)) needs the shape of the surface as well: `R`,
+the major radius [m] at the nodes, `dRdrho`, its derivative with respect to `rho` at
+constant θ, and optionally `dRdt = ∂R/∂θ` (spectral by default). `ζ` must then be the
+geometric toroidal angle or differ from it by a function of θ only, as the Boozer angle
+of an axisymmetric field does.
 """
 struct Field
     rho::Float64
@@ -62,12 +68,15 @@ struct Field
     G::Float64
     psi_rho::Float64
     psi_r::Float64
+    R::Matrix{Float64}        # empty unless given
+    dRdrho::Matrix{Float64}
+    dRdt::Matrix{Float64}
 end
 
 function Field(rho::Real, B_sup_t::AbstractMatrix, B_sup_z::AbstractMatrix, B_sub_t::AbstractMatrix,
     B_sub_z::AbstractMatrix, Bmag::AbstractMatrix, sqrtg::AbstractMatrix;
     Psi=nothing, iota=nothing, R_major=nothing, a_minor=nothing, NFP::Integer=1,
-    dBdt=nothing, dBdz=nothing, B0=nothing)
+    dBdt=nothing, dBdz=nothing, B0=nothing, R=nothing, dRdrho=nothing, dRdt=nothing)
 
     ntheta, nzeta = size(sqrtg)
     for a in (B_sup_t, B_sup_z, B_sub_t, B_sub_z, Bmag)
@@ -97,10 +106,13 @@ function Field(rho::Real, B_sup_t::AbstractMatrix, B_sup_z::AbstractMatrix, B_su
     psi_rho = Psi / π * rho
     theta = collect(range(0, 2π; length=ntheta + 1))[1:ntheta]
     zeta = collect(range(0, 2π / NFP; length=nzeta + 1))[1:nzeta]
+    shape(a) = a === nothing ? zeros(0, 0) : (@assert size(a) == (ntheta, nzeta); Matrix{Float64}(a))
+    R, dRdrho = shape(R), shape(dRdrho)
+    dRdt = dRdt === nothing ? (isempty(R) ? zeros(0, 0) : spectral_derivative_matrix(ntheta) * R) : shape(dRdt)
     return Field(rho, ntheta, nzeta, NFP, theta, zeta, fill(2π / ntheta, ntheta), fill(2π / NFP / nzeta, nzeta),
         Matrix{Float64}(B_sup_t), Matrix{Float64}(B_sup_z), Matrix{Float64}(B_sub_t), Matrix{Float64}(B_sub_z),
         sqrtg, Bmag, Matrix{Float64}(dBdt), Matrix{Float64}(dBdz), bdotgradB, BxgradrhodotgradB,
-        fsa(Bmag), fsa(Bmag .^ 2), Psi, iota, R_major, a_minor, B0, I, G, psi_rho, psi_rho / a_minor)
+        fsa(Bmag), fsa(Bmag .^ 2), Psi, iota, R_major, a_minor, B0, I, G, psi_rho, psi_rho / a_minor, R, dRdrho, dRdt)
 end
 
 """

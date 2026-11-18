@@ -25,12 +25,13 @@ function plane_matrix(op::DKEOperator{Float64}, i::Integer, s::Integer)
     @assert nz == 1
     tr, col, w = op.trajectories, op.collisions, op.weights
     j = i + nx * (s - 1)
-    shift = col.Klocal[j, j] + w[8]
-    scatter = -col.weights[1] * col.nus[i, s] / 2
+    rot = col.rotating
     rows, cols, vals = Int[], Int[], Float64[]
     idx(a, t) = a + na * (t - 1)
     for t in 1:nt, a in 1:na
         r = idx(a, t)
+        shift = (rot === nothing ? col.Klocal[j, j] : rot.Klocal[j, j, t]) + w[8]
+        scatter = -col.weights[1] * (rot === nothing ? col.nus[i, s] : rot.nus[i, s, t]) / 2
         wind = tr.wt[a, t, 1, i, s]
         st = wind > 0 ? tr.Dt[2] : tr.Dt[1]
         for k in st.ptr[t]:(st.ptr[t+1]-1)
@@ -107,7 +108,9 @@ end
 
 Galerkin projection of the bordered operator on the first `nl` Legendre moments at
 every `(θ, x, s)`: unknowns `c[l, j, θ]` at index `(θ-1) nl n + (l-1) n + j` with
-`j = i + nx (s-1)`, then the surface averages of `c[1, j, θ]`, then the sources.
+`j = i + nx (s-1)`, then the surface averages of `c[1, j, θ]`, then the sources. In a
+rotating plasma the auxiliary unknowns are instead the moments `⟨M c⟩` and `⟨M K0 c⟩` of
+[`RotatingCollisions`](@ref).
 """
 function moment_coarse_matrix(op::DKEOperator{Float64}, border::DKEBorder, nl::Integer)
     na, nt, nz, nx, ns = state_size(op)
@@ -117,9 +120,11 @@ function moment_coarse_matrix(op::DKEOperator{Float64}, border::DKEBorder, nl::I
     P = col.Txi[:, 1:nl]
     W = [(2l - 1) / 2 * op.pitchgrid.wxi[a] * P[a, l] for l in 1:nl, a in 1:na]
     cidx(l, t, j) = (t - 1) * nl * n + (l - 1) * n + j
+    rot = col.rotating
+    naux = rot === nothing ? n : 2 * size(rot.V, 2)
     aux(j) = nl * nt * n + j
-    src(s, k) = nl * nt * n + n + 2 * (s - 1) + k
-    nc = nl * nt * n + n + 2ns
+    src(s, k) = nl * nt * n + naux + 2 * (s - 1) + k
+    nc = nl * nt * n + naux + 2ns
     rows, cols, vals = Int[], Int[], Float64[]
     add(r, c, v) = (push!(rows, r); push!(cols, c); push!(vals, v))
 
@@ -160,7 +165,7 @@ function moment_coarse_matrix(op::DKEOperator{Float64}, border::DKEBorder, nl::I
                     blk[lp, l] += W[lp, a] * w[2] * wind * dP[a, l, d]
                 end
             end
-            blk .-= col.weights[1] * col.nus[i, s] / 2 .* WDP
+            blk .-= col.weights[1] * (rot === nothing ? col.nus[i, s] : rot.nus[i, s, t]) / 2 .* WDP
             for lp in 1:nl, l in 1:nl
                 blk[lp, l] == 0 || add(cidx(lp, t, j), cidx(l, t, j), blk[lp, l])
             end
@@ -184,19 +189,42 @@ function moment_coarse_matrix(op::DKEOperator{Float64}, border::DKEBorder, nl::I
                     add(src(s, k), cidx(l, t, j), v)
                 end
             end
-            add(aux(j), cidx(1, t, j), -op.surface_weights[t, 1])
+            rot === nothing && add(aux(j), cidx(1, t, j), -op.surface_weights[t, 1])
         end
-        add(aux(j), aux(j), 1.0)
+        rot === nothing && add(aux(j), aux(j), 1.0)
     end
     # terms coupling speeds and species, local in θ
     for t in 1:nt, l in 1:nl, lp in 1:nl, j in 1:n, jp in 1:n
-        v = M[lp, l] * (col.Klocal[jp, j] + col.KGH[jp, j, l] + (jp == j ? w[8] : 0.0))
+        K = rot === nothing ? col.Klocal[jp, j] + col.KGH[jp, j, l] : rot.Klocal[jp, j, t] + rot.KGH[jp, j, l, t]
+        v = M[lp, l] * (K + (jp == j ? w[8] : 0.0))
         v == 0 || add(cidx(lp, t, jp), cidx(l, t, j), v)
     end
-    if !isempty(col.exchange)
-        for t in 1:nt, lp in 1:nl, j in 1:n, jp in 1:n
-            v = M[lp, 1] * col.Kexchange[jp, j]
-            v == 0 || add(cidx(lp, t, jp), aux(j), v)
+    if rot === nothing
+        if !isempty(col.exchange)
+            for t in 1:nt, lp in 1:nl, j in 1:n, jp in 1:n
+                v = M[lp, 1] * col.Kexchange[jp, j]
+                v == 0 || add(cidx(lp, t, jp), aux(j), v)
+            end
+        end
+    elseif !isempty(rot.V)
+        # exchange correction A (G m - u) - K0 V m with m = ⟨M c⟩, u = ⟨M K0 c⟩
+        nk = size(rot.V, 2)
+        for k in 1:nk
+            add(aux(k), aux(k), 1.0)
+            add(aux(nk + k), aux(nk + k), 1.0)
+            for t in 1:nt, j in 1:n
+                v = -op.surface_weights[t, 1] * rot.M[k, j, t]
+                v == 0 || add(aux(k), cidx(1, t, j), v)
+                v = -op.surface_weights[t, 1] * rot.MK[k, j, t]
+                v == 0 || add(aux(nk + k), cidx(1, t, j), v)
+            end
+        end
+        for t in 1:nt
+            AG = rot.A[:, :, t] * rot.G .- rot.KV[:, :, t]
+            for lp in 1:nl, k in 1:nk, jp in 1:n
+                AG[jp, k] == 0 || add(cidx(lp, t, jp), aux(k), M[lp, 1] * AG[jp, k])
+                rot.A[jp, k, t] == 0 || add(cidx(lp, t, jp), aux(nk + k), -M[lp, 1] * rot.A[jp, k, t])
+            end
         end
     end
     return sparse(rows, cols, vals, nc, nc), P, W
@@ -223,8 +251,9 @@ function _coarse_correction!(z::AbstractVector, C::MomentCoarseSpace, r::Abstrac
         end
         cm[j, l, t] = acc
     end
-    rc[(nl*n*nt+1):(nl*n*nt+n)] .= 0
-    rc[(nl*n*nt+n+1):end] .= view(r, (N+1):length(r))
+    naux = length(rc) - nl * n * nt - 2ns   # auxiliary unknowns of the exchange term
+    rc[(nl*n*nt+1):(nl*n*nt+naux)] .= 0
+    rc[(nl*n*nt+naux+1):end] .= view(r, (N+1):length(r))
     c = C.factor \ rc
     cc = reshape(view(c, 1:(nl*n*nt)), n, nl, nt)
     @inbounds for j in 1:n, t in 1:nt, a in 1:na
@@ -234,7 +263,7 @@ function _coarse_correction!(z::AbstractVector, C::MomentCoarseSpace, r::Abstrac
         end
         Z[a, t, j] = acc
     end
-    z[(N+1):end] .= view(c, (nl*n*nt+n+1):length(c))
+    z[(N+1):end] .= view(c, (nl*n*nt+naux+1):length(c))
     apply_bordered!(C.work, op, border, z)
     r .-= C.work
     return z
@@ -306,6 +335,8 @@ function _row_scaling(op::DKEOperator{Float64}, border::DKEBorder)
     x, wx, wxi = op.speedgrid.x, op.speedgrid.wx, op.pitchgrid.wxi
     for (s, sp) in enumerate(op.species), i in 1:nx, z in 1:nz, t in 1:nt, a in 1:na
         Sf[a, t, z, i, s] = sqrt(exp(-x[i]^2) * x[i]^2 * wx[i] * wxi[a] * op.surface_weights[t, z]) / sp(x[i] * sp.v_thermal)
+        # Maxwellian of the local density in a rotating plasma
+        op.rotation === nothing || (Sf[a, t, z, i, s] /= op.rotation.density[t, s])
     end
     for (s, sp) in enumerate(op.species), k in 1:2
         S[N+2(s-1)+k] = 1 / (sum(view(border.constraints, :, :, :, :, k)) * sp(0.0))
@@ -421,7 +452,8 @@ const SAME_INPUT = 1e-12
 
 _plasma_state(op::DKEOperator) = Float64[(sp.temperature for sp in op.species)..., (sp.density for sp in op.species)...,
     (sp.temperature for sp in op.background)..., (sp.density for sp in op.background)...,
-    (sp.species.charge for sp in op.species)..., (sp.species.charge for sp in op.background)..., op.Erho]
+    (sp.species.charge for sp in op.species)..., (sp.species.charge for sp in op.background)..., op.Erho,
+    (op.rotation === nothing ? () : (op.rotation.omega,))...]
 
 # largest relative change of a temperature, density or charge, or of Erho, since `reference`
 function _plasma_change(op::DKEOperator, reference::Vector{Float64})
@@ -440,6 +472,12 @@ function _input_state(op::DKEOperator, EparB::Real)
     T = op.species[1].temperature
     append!(state, (op.Erho, EparB))
     append!(scale, (abs(op.Erho) + T, abs(EparB) + floatmin()))
+    if op.rotation !== nothing
+        # against the angular velocity at which the first species is sonic at the reference point
+        sonic = op.species[1].v_thermal / op.field.R[op.rotation.theta_ref, 1]
+        append!(state, (op.rotation.omega, op.rotation.domega_drho))
+        append!(scale, (abs(op.rotation.omega) + sonic, abs(op.rotation.domega_drho) + sonic))
+    end
     return state, scale
 end
 

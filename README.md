@@ -76,7 +76,7 @@ convective part.
 
 **Solver for axisymmetric fields.** The Python code solves every case with a GCROT
 Krylov method preconditioned by geometric multigrid. `solve_dke_tokamak` instead uses
-GMRES with a two level preconditioner: a sparse coarse solve for the first four Legendre
+flexible GMRES with a two level preconditioner: a sparse coarse solve for the first four Legendre
 moments in pitch angle at every poloidal point, speed and species, which carry the
 conserved quantities and the coupling between speeds and species that dominates at
 high collisionality, followed by an exact sparse LU of the two dimensional (pitch
@@ -88,7 +88,7 @@ diagonal dominance that multigrid smoothers need, which makes the centred stenci
 `p1 = "4z"` (an option of yancc as well, though its multigrid solver does not converge
 with it) practical. It reaches a given accuracy on a much coarser grid than the default
 upwind stencil `"4d"`, and is recommended with `solve_dke_tokamak`. The defaults of
-`DKEOperator` are those of yancc.
+`DKEOperator` are those of yancc, except that `"4z"` is the default with `rotation`.
 
 **Residual norm.** `rtol` of `solve_dke_tokamak` is measured in a norm that weighs all
 species alike, so its values are not those of the Python `rtol`. At low collisionality
@@ -145,6 +145,48 @@ flow, which collisions determine only through small differences, is 4 % off at
 ill conditioned for double precision; `solve_dke_tokamak` warns when rounding stops
 the residual above 10⁻⁶. Both are properties of the discretization, not of the solver.
 
+## Sonic toroidal rotation
+
+For axisymmetric fields the plasma may rotate toroidally with an angular velocity `ω(ρ)` of the order
+of the ion thermal speed over `R`, common to all species:
+
+```julia
+field = Field(ρ, B_sup_t, B_sup_z, B_sub_t, B_sub_z, Bmag, sqrtg; R_major, a_minor, iota, R=R, dRdrho=dRdρ)  # R(θ) and ∂R/∂ρ at fixed θ
+op = DKEOperator(field, UniformPitchAngleGrid(97), MaxwellSpeedGrid(8), species, 0.0;
+    rotation=Rotation(ω, dω_dρ))        # rad/s along +ζ, and its derivative in ρ
+sol = solve_dke_tokamak(op)
+sol.particle_flux, sol.heat_flux, sol.angular_momentum_flux
+energy_flux(sol, op)                     # energy flux with the potential energy as NEO measures it (frame = :rotating, :laboratory)
+nondissipative_fluxes(op)                # to be added on surfaces without up-down symmetry
+```
+
+The equations are solved in the rotating frame: Maxwellians whose densities vary on the surface with
+the centrifugal potential and with the electrostatic potential that quasineutrality requires, the
+parallel force of that potential energy, the radial drifts in its gradient and the Coriolis drift,
+the collision operator about the local densities, and the drive by the rotation shear. The
+densities and density gradients of the species are those at the outboard midplane. The solution
+gives the fluxes of particles, energy and toroidal angular momentum. On a surface without up-down
+symmetry the fluxes of the kinetic equation are not ambipolar by themselves; `nondissipative_fluxes`
+returns the collisionless ("gyroviscous") part that completes them. ForwardDiff derivatives include
+`ω` and `dω/dρ`. Without `rotation` the code and its results are those of the port.
+
+The rotation model was written from the published literature, and benchmarked against NEO. The
+source of NEO was not consulted, it was run as a black box to produce the reference data.
+
+Agreement with NEO (`ROTATION_MODEL = 2`, full Fokker-Planck operator) at 12 speeds × 193 pitch
+angles × 65 poloidal nodes against NEO's finest run of each case:
+
+| Case | particle fluxes of D, C | energy fluxes of D, e | momentum fluxes of D, C |
+|---|---|---|---|
+| MAST-U H-mode sample case of FUSE, ρ = 0.65 to 0.85 (carbon Mach number 1.4) | within 1.1 % | within 0.6 % | within 1.6 % |
+| the same, ρ = 0.25, 0.45, 0.55 | 2.2 to 5.7 % | 0.4 to 3.4 % | 0.7 to 7.3 % |
+| ρ = 0.45 with the rotation halved, doubled, reversed, shear only, field directions reversed | 2 to 4.5 % | 1.5 to 2.2 % | within 3.1 % |
+| collisional circular case, carbon Mach number 2.4, with and without shear | 1.6 %, 2.4 % | within 0.4 % | 0.5 %, 3 % |
+| gyroviscous fluxes on surfaces without up-down symmetry | 1e-4 to 8e-4 | | |
+| potential and densities on the surface | 6e-7 (neutral input) | | |
+
+The differences at the inner radii are the same without rotation.
+
 ## Automatic differentiation
 
 With ForwardDiff loaded, the species, `Erho` and `EparB` may be dual numbers, and the
@@ -190,7 +232,9 @@ from an IMAS data dictionary and returns the fluxes in gyro-Bohm units; in FUSE 
 selected with `act.ActorNeoclassical.model = :yancc`. At the default resolution
 (6 × 65 × 41) the energy fluxes of an ITER baseline case are 2 to 3 % above the
 converged values at mid radius and 11 % above in the collisionless core, where
-`nalpha = 129` brings them within 4 %.
+`nalpha = 129` brings them within 4 %. The wrapper passes the toroidal rotation of the
+profiles (`rotation = true`) and returns the toroidal stress as well, with the conventions
+of the fluxes that FUSE reads from NEO.
 
 ## License
 
@@ -204,6 +248,11 @@ If you use Yancc.jl, please cite the paper that introduced the method:
 > neoclassical transport in tokamaks and stellarators",
 > *Plasma Phys. Control. Fusion* **68**, 115001 (2026).
 > [doi:10.1088/1361-6587/aeb628](https://doi.org/10.1088/1361-6587/aeb628)
+
+The model of sonic toroidal rotation follows F.L. Hinton and S.K. Wong, *Phys. Fluids* **28**, 3082
+(1985); H. Sugama and W. Horton, *Phys. Plasmas* **4**, 2215 (1997); E.A. Belli, J. Candy and
+C. Angioni, *Plasma Phys. Control. Fusion* **56**, 124002 (2014); E.A. Belli and J. Candy,
+*Phys. Plasmas* **25**, 032301 (2018).
 
 ```bibtex
 @article{Conlin2026yancc,
