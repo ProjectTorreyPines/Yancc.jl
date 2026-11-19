@@ -1,4 +1,5 @@
-# Restarted GMRES with right preconditioning for a batch of systems, iterated together.
+# Restarted GMRES with right preconditioning, in the flexible form of src/gmres.jl, for a
+# batch of systems, iterated together.
 
 """
     gmres_batched!(X, A!, B, M!; rtol=1e-8, restart=60, maxiter=300)
@@ -24,6 +25,7 @@ function gmres_batched!(X::AbstractMatrix{T}, A!, B::AbstractMatrix{T}, M!;
     n, nb = size(B)
     m = min(restart, maxiter)
     V = similar(B, n, min(m, 12) + 1, nb)   # Krylov bases [:, vector, system], grown as needed
+    Zp = similar(B, n, min(m, 12), nb)      # preconditioned bases M⁻¹ v_j, see gmres!
     H = zeros(T, m + 1, m, nb)
     cs, sn, g = zeros(T, m, nb), zeros(T, m, nb), zeros(T, m + 1, nb)
     coefficients = similar(B, m, 1, nb)
@@ -71,8 +73,15 @@ function gmres_batched!(X::AbstractMatrix{T}, A!, B::AbstractMatrix{T}, M!;
                 _free!(V)
                 V = grown
             end
+            if j > size(Zp, 2)
+                grown = similar(Zp, n, min(2 * size(Zp, 2), m), nb)
+                view(grown, :, 1:size(Zp, 2), :) .= Zp
+                _free!(Zp)
+                Zp = grown
+            end
             Vj .= view(V, :, j, :)
             M!(Z, Vj)
+            view(Zp, :, j, :) .= Z
             A!(W, Z)
             # classical Gram-Schmidt, applied twice
             basis = view(V, :, 1:j, :)
@@ -126,9 +135,8 @@ function gmres_batched!(X::AbstractMatrix{T}, A!, B::AbstractMatrix{T}, M!;
             s = steps[k]
             s > 0 && status[k] != :failed && (y[1:s, 1, k] .= UpperTriangular(view(H, 1:s, 1:s, k)) \ view(g, 1:s, k))
         end
-        _batched_gemm!('N', 'N', one(T), view(V, :, 1:last, :), _like(B, y), zero(T), W3)
-        M!(Z, W)
-        X .+= Z
+        _batched_gemm!('N', 'N', one(T), view(Zp, :, 1:last, :), _like(B, y), zero(T), W3)
+        X .+= W
         A!(R, X)
         R .= B .- R
         previous = beta
@@ -149,6 +157,6 @@ function gmres_batched!(X::AbstractMatrix{T}, A!, B::AbstractMatrix{T}, M!;
         end
     end
     residuals = [bnorm[k] == 0 ? 0.0 : status[k] == :failed ? NaN : Float64(beta[k] / bnorm[k]) for k in 1:nb]
-    foreach(_free!, (V, W, Z, R, Vj, coefficients))   # the Krylov basis is the largest of them
+    foreach(_free!, (V, Zp, W, Z, R, Vj, coefficients))   # the Krylov bases are the largest of them
     return (X, iterations, residuals, status)
 end

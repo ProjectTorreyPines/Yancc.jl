@@ -12,6 +12,7 @@ for every case of the batched operator `bop`.
 """
 struct BatchedTokamakPreconditioner{PL,CO,D<:NamedTuple,W<:NamedTuple}
     nl::Int
+    naux::Int     # unknowns of the coarse matrices between the moments and the sources
     planes::PL    # factors of the plane matrices, index j + n (b - 1)
     coarse::CO    # factors of the coarse matrices, one per case
     data::D
@@ -42,8 +43,9 @@ function PreconditionerMaps(op::DKEOperator{Float64}, nl::Integer, speed::Bool, 
     @assert coarse_solver in (:sparse, :block) && plane_solver in (:sparse, :block)
     na, nt = state_size(op)[1:2]
     plane_blocks = plane_solver == :block ? _plane_block_layout(op) : nothing   # nothing: grid too small
-    planes = plane_blocks === nothing ? AssemblyMap(_plane_entries(op)..., device) :
-             PlaneBlockMap(_plane_entries(op)[1], na, nt, 4na * nt + 2, plane_blocks, device)
+    plane_entries = _plane_entries(op)
+    planes = plane_blocks === nothing ? AssemblyMap(plane_entries..., device) :
+             PlaneBlockMap(plane_entries[1], na, nt, plane_entries[3], plane_blocks, device)
     entries, m, ningredients, layout, projections, P, W = _coarse_entries(op, nl, speed)
     data = map(A -> _to_device(device, A), (; projections..., P, W))
     blocks = coarse_solver == :block ? _coarse_block_layout(op, nl) : nothing   # nothing: grid too small
@@ -72,11 +74,12 @@ function BatchedTokamakPreconditioner(maps::PreconditionerMaps, bop::BatchedDKE,
     na, nt, nx, ns = bop.dims
     B, np, n = bop.nbatch, na * nt, nx * ns
     nl = maps.nl
-    nc = nl * nt * n + n + 2ns
+    naux = _coarse_aux(maps.layout)
+    nc = nl * nt * n + naux + 2ns
     like(dims...) = similar(bop.data.wa, dims...)
     work = (Rf=like(np, n * B), Zf=like(np, n * B), WR=like(nl, nt, n, B), cm=like(n, nl, nt, B),
         rc=like(nc, B), c=like(nc, B), AZ=like(np * n + 2ns, B))
-    return BatchedTokamakPreconditioner(nl, _factor_planes(device, planes), _factor_coarse(device, coarse),
+    return BatchedTokamakPreconditioner(nl, naux, _factor_planes(device, planes), _factor_coarse(device, coarse),
         (P=maps.data.P, W=maps.data.W), work)
 end
 
@@ -91,8 +94,9 @@ function _precondition!(Z::AbstractMatrix, P::BatchedTokamakPreconditioner, R::A
     na, nt, nx, ns = bop.dims
     B, np, n, nl = bop.nbatch, na * nt, nx * ns, P.nl
     N, nB = np * n, n * B
-    ncm = nl * n * nt          # moments; then n surface averages and 2 ns sources
-    nc = ncm + n + 2ns
+    ncm = nl * n * nt          # moments; then the auxiliary unknowns and 2 ns sources
+    naux = P.naux
+    nc = ncm + naux + 2ns
     w = P.work
 
     # coarse correction: Z = prolongation of the coarse solution, R = R - K Z
@@ -101,13 +105,13 @@ function _precondition!(Z::AbstractMatrix, P::BatchedTokamakPreconditioner, R::A
     permutedims!(w.cm, w.WR, (3, 1, 2, 4))
     fill!(w.rc, 0)
     view(w.rc, 1:ncm, :) .= reshape(w.cm, ncm, B)
-    view(w.rc, (ncm+n+1):nc, :) .= view(R, (N+1):(N+2ns), :)
+    view(w.rc, (ncm+naux+1):nc, :) .= view(R, (N+1):(N+2ns), :)
     _solve_batch!(w.c, P.coarse, w.rc)
     reshape(w.cm, ncm, B) .= view(w.c, 1:ncm, :)
     permutedims!(w.WR, w.cm, (2, 3, 1, 4))
     mul!(reshape(w.Zf, na, nt * nB), P.data.P, reshape(w.WR, nl, nt * nB))
     view(Z, 1:N, :) .= reshape(w.Zf, N, B)
-    view(Z, (N+1):(N+2ns), :) .= view(w.c, (ncm+n+1):nc, :)
+    view(Z, (N+1):(N+2ns), :) .= view(w.c, (ncm+naux+1):nc, :)
     apply_bordered!(w.AZ, bop, Z)
     R .-= w.AZ
 

@@ -111,6 +111,55 @@ else
         @test length(solve_dke_tokamak_batch(ops; device=:auto, batchsize=3)) == length(ops)
     end
 
+    @testset "CUDA: rotation, exchange = $energy_exchange" for energy_exchange in (false, true)
+        ops = rotating_batch_cases(; energy_exchange)
+        host, dev = Yancc.BatchedDKE(ops, Val(:cpu)), Yancc.BatchedDKE(ops, cuda)
+        M = Yancc.system_size(ops[1])
+        X = reduce(hcat, [test_vector(M) .* (1 + 0.1 * k) .+ 0.01 * k for k in eachindex(ops)])
+        Y = Yancc.apply_bordered!(similar(X), host, X)
+        Yd = Yancc.apply_bordered!(CUDA.CuArray(similar(X)), dev, CUDA.CuArray(X))
+        @test Array(Yd) ≈ Y rtol = 1e-12
+        @test Array(dev.data.scaling) ≈ host.data.scaling rtol = 1e-13
+        EparB = [0.0, 0.02, -0.01, 0.0]
+        @test Array(Yancc._batched_rhs(ops, EparB, dev)) ≈ Yancc._batched_rhs(ops, EparB, host) rtol = 1e-13
+        Z = Yancc._precondition!(similar(X), Yancc.BatchedTokamakPreconditioner(ops, host, Val(:cpu)), copy(X), host)
+        Zd = Yancc._precondition!(CUDA.CuArray(similar(X)), Yancc.BatchedTokamakPreconditioner(ops, dev, cuda), CUDA.CuArray(X), dev)
+        @test maximum(norm(Array(Zd)[:, k] - Z[:, k]) / norm(Z[:, k]) for k in eachindex(ops)) < 1e-4
+        sols = solve_dke_tokamak_batch(ops; EparB, rtol=1e-10, device=:cuda)
+        for (k, op) in enumerate(ops)
+            ref = solve_dke_tokamak(op; EparB=EparB[k], rtol=1e-10)
+            @test sols[k].residual < 1e-10
+            @test sols[k].iterations <= ref.iterations + 2
+            for f in (:particle_flux, :heat_flux, :VparB)
+                @test getfield(sols[k], f) ≈ getfield(ref, f) rtol = 1e-7
+            end
+            @test sols[k].angular_momentum_flux ≈ ref.angular_momentum_flux rtol = 1e-7 atol = 1e-7 * maximum(abs, sols[2].angular_momentum_flux)
+            @test sols[k].JparB ≈ ref.JparB rtol = 1e-7
+        end
+    end
+
+    @testset "CUDA: rotation at working resolution, the cases checked against NEO" begin
+        # one batch of the MAST-U cases of golden/rotation.npz (41 poloidal nodes), with the plane
+        # matrices by dense blocks, against the single case solver
+        d = golden("rotation")
+        ops = [begin
+            p = "fluxes_" * case * "_"
+            DKEOperator(rotation_field(d, p), UniformPitchAngleGrid(65), MaxwellSpeedGrid(6), golden_species(d, p), 0.0;
+                lnlambda=d[p*"lnlambda"], rotation=rotation_of(d, p))
+        end for case in ("mastu_r045_rot", "mastu_r085_rot", "mastu_r065_rot", "mastu_r045_reversed", "mastu_r045_bothflip",
+            "mastu_r045_shearonly", "updown_mastu_r045_rot")]
+        dev = solve_dke_tokamak_batch(ops; device=:cuda, rtol=1e-8)
+        for (k, op) in enumerate(ops)
+            ref = solve_dke_tokamak(op; rtol=1e-8)
+            @test dev[k].residual < 1e-8
+            @test dev[k].iterations <= ref.iterations + 3
+            for f in (:particle_flux, :heat_flux, :angular_momentum_flux)
+                @test getfield(dev[k], f) ≈ getfield(ref, f) rtol = 1e-5
+            end
+            @test dev[k].JparB ≈ ref.JparB rtol = 1e-5
+        end
+    end
+
     @testset "CUDA: working resolution" begin
         # sizes at which every code path is taken (restriction, prolongation and plane
         # solves of thousands of unknowns), against the single case solver

@@ -29,6 +29,8 @@ struct BatchedDKE{D<:NamedTuple,W<:NamedTuple}
     krook::Float64
     has_speed::Bool
     has_exchange::Bool
+    rotating::Bool        # sonic rotation: collisions of each poloidal point, see RotatingCollisions
+    nk::Int               # moments of its exchange correction (0 without one)
     data::D
     work::W
 end
@@ -57,9 +59,11 @@ function _check_batch(ops::AbstractVector{<:DKEOperator})
                b.collisions.D == a.collisions.D && b.collisions.Txi == a.collisions.Txi &&
                b.speedgrid.x == a.speedgrid.x && b.trajectories.Dx == a.trajectories.Dx &&
                all(_same_stencil(b.trajectories.Dt[d], a.trajectories.Dt[d]) for d in 1:2) &&
-               all(_same_stencil(b.trajectories.Da[d], a.trajectories.Da[d]) for d in 1:2)
+               all(_same_stencil(b.trajectories.Da[d], a.trajectories.Da[d]) for d in 1:2) &&
+               (b.rotation === nothing) == (a.rotation === nothing)
         same || throw(ArgumentError("case $k differs from case 1 in its grids, stencils, operator weights, " *
-                                    "Legendre modes or energy exchange option; the cases of a batch must share these"))
+                                    "Legendre modes, energy exchange option or in having a rotation; the cases of a " *
+                                    "batch must share these"))
     end
     return nothing
 end
@@ -75,12 +79,23 @@ function BatchedDKE(ops::AbstractVector{<:DKEOperator{Float64}}, device::Val;
     nL = op1.collisions.nL
     w = op1.weights
     has_speed = speed
-    has_exchange = !isempty(op1.collisions.exchange)
+    rotating = op1.rotation !== nothing
+    nk = rotating ? size(op1.collisions.rotating.V, 2) : 0
+    # without rotation the exchange correction acts on the surface averages; with it, on the moments of RotatingCollisions
+    has_exchange = !rotating && !isempty(op1.collisions.exchange)
 
     wa, wt = zeros(np, nB), zeros(np, nB)
     wx = has_speed ? zeros(np, nB) : zeros(0, 0)
-    nuscale, shift = zeros(1, nB), zeros(1, nB)
-    KlocalT, KGHT = zeros(n, n, B), zeros(n, n, nL * B)
+    # with rotation: scatter and shift at each poloidal point [θ, j b], the local collision
+    # matrix of each point [:, :, θ b], the density over that of the reference point by rows
+    # of the Rosenbluth part, and the factors of the exchange correction on the index θ + nt (j - 1)
+    nuscale, shift = rotating ? (zeros(nt, nB), zeros(nt, nB)) : (zeros(1, nB), zeros(1, nB))
+    KlocalT, KGHT = zeros(n, n, (rotating ? nt : 1) * B), zeros(n, n, nL * B)
+    rowdens = rotating ? zeros(nt, n, 1, B) : zeros(0, 0, 0, 0)
+    invdens = rotating ? zeros(1, nt, 1, ns, B) : zeros(0, 0, 0, 0, 0)
+    XM, XK = (zeros(nk, nt * n, B) for _ in 1:2)
+    XA, XKV = (zeros(nt * n, nk, B) for _ in 1:2)
+    XG = zeros(nk, nk, B)
     Kexchange = has_exchange ? zeros(n, n, B) : zeros(0, 0, 0)
     S1, S2 = zeros(nx, ns, B), zeros(nx, ns, B)
     sw = zeros(1, nt, 1, B)
@@ -95,9 +110,30 @@ function BatchedDKE(ops::AbstractVector{<:DKEOperator{Float64}}, device::Val;
         wa[:, cols] .= w[2] .* reshape(tr.wa, np, n)
         wt[:, cols] .= w[3] .* reshape(tr.wt, np, n)
         has_speed && (wx[:, cols] .= w[1] .* reshape(tr.wx, np, n))
-        nuscale[1, cols] .= (-col.weights[1] / 2) .* vec(col.nus)
-        shift[1, cols] .= diag(col.Klocal) .+ w[8]
-        KlocalT[:, :, b] .= transpose(col.Klocal)
+        if rotating
+            rot = col.rotating
+            for t in 1:nt
+                nuscale[t, cols] .= (-col.weights[1] / 2) .* vec(view(rot.nus, :, :, t))
+                shift[t, cols] .= diag(view(rot.Klocal, :, :, t)) .+ w[8]
+                KlocalT[:, :, t+nt*(b-1)] .= transpose(view(rot.Klocal, :, :, t))
+                for s in 1:ns
+                    rowdens[t, (1:nx).+nx*(s-1), 1, b] .= op.rotation.density[t, s]
+                    invdens[1, t, 1, s, b] = 1 / op.rotation.density[t, s]
+                end
+                for j in 1:n, k in 1:nk
+                    row = t + nt * (j - 1)
+                    XM[k, row, b] = op.surface_weights[t, 1] * rot.M[k, j, t]
+                    XK[k, row, b] = op.surface_weights[t, 1] * rot.MK[k, j, t]
+                    XA[row, k, b] = rot.A[j, k, t]
+                    XKV[row, k, b] = rot.KV[j, k, t]
+                end
+            end
+            nk > 0 && (XG[:, :, b] .= rot.G)
+        else
+            nuscale[1, cols] .= (-col.weights[1] / 2) .* vec(col.nus)
+            shift[1, cols] .= diag(col.Klocal) .+ w[8]
+            KlocalT[:, :, b] .= transpose(col.Klocal)
+        end
         for l in 1:nL
             KGHT[:, :, l+nL*(b-1)] .= transpose(view(col.KGH, :, :, l))
         end
@@ -130,6 +166,8 @@ function BatchedDKE(ops::AbstractVector{<:DKEOperator{Float64}}, device::Val;
     constraints = reshape(pitch .* dev(dr) .* speedk, np * nx, 2, B)
     scaling = similar(constraints, N + 2ns, B)
     view(scaling, 1:N, :) .= reshape(dev(reshape(sqrt.(wxig), na, 1, 1, 1, 1)) .* dev(root_sw) .* dev(speed_scale), N, B)
+    # Maxwellian of the local density in a rotating plasma, as in _row_scaling
+    rotating && (reshape(view(scaling, 1:N, :), na, nt, nx, ns, B) .*= dev(invdens))
     view(scaling, (N+1):(N+2ns), :) .= dev(border_scale)
     data = (
         # common to all cases: derivative along α and θ with either stencil, pitch
@@ -141,13 +179,18 @@ function BatchedDKE(ops::AbstractVector{<:DKEOperator{Float64}}, device::Val;
         # per case
         wa=dev(wa), wt=dev(wt), wx=dev(wx), nuscale=dev(nuscale), shift=dev(shift), DxT=dev(DxT),
         KlocalT=dev(KlocalT), KGHT=dev(KGHT), Kexchange=dev(Kexchange),
+        rowdens=dev(rowdens), coldens=dev(rotating ? reshape(permutedims(rowdens, (2, 1, 4, 3)), 1, n, 1, nt, B) : zeros(0, 0, 0, 0, 0)),   # [1, j, 1, θ, b]
+        XM=dev(XM), XK=dev(XK), XA=dev(XA), XKV=dev(XKV), XG=dev(XG),
         S1=dev(S1), S2=dev(S2), constraints, sw=dev(sw), scaling)
 
     like(dims...) = similar(data.wa, dims...)
     work = (F=like(np, nB), O=like(np, nB), T=like(np, nB), T2=like(np, nB), mean=like(1, nt * nB),
         Fm=like(nL, nt, n, B), Gm=like(nL, nt, n, B), P=like(nt, n, nL, B), Q=like(nt, n, nL, B),
-        c=like(1, 1, n, B), d=like(n, 1, B), src=like(2ns, B), coef=like(nx, ns, B), con=like(2ns, B))
-    return BatchedDKE((na, nt, nx, ns), B, nL, w[8], has_speed, has_exchange, data, work)
+        c=like(1, 1, n, B), d=like(n, 1, B), src=like(2ns, B), coef=like(nx, ns, B), con=like(2ns, B),
+        # with rotation: the state with θ after the (speed, species) index, the isotropic part and the moments
+        Fp=rotating ? like(na, n, nt, B) : like(0, 0, 0, 0), Op=rotating ? like(na, n, nt, B) : like(0, 0, 0, 0),
+        iso=like(rotating ? nt * n : 0, 1, B), dx=like(rotating ? nt * n : 0, 1, B), xm=like(nk, 1, B), xu=like(nk, 1, B))
+    return BatchedDKE((na, nt, nx, ns), B, nL, w[8], has_speed, has_exchange, rotating, nk, data, work)
 end
 
 """
@@ -182,19 +225,31 @@ function apply_bordered!(Y::AbstractMatrix, bop::BatchedDKE, X::AbstractMatrix)
     end
 
     # collisions local in pitch angle: energy scattering and local field particle part
-    _batched_gemm!('N', 'N', 1.0, F3, d.KlocalT, 1.0, O3)
+    if bop.rotating   # a matrix for each poloidal point
+        permutedims!(w.Fp, reshape(F, na, nt, n, B), (1, 3, 2, 4))
+        _batched_gemm!('N', 'N', 1.0, reshape(w.Fp, na, n, nt * B), d.KlocalT, 0.0, reshape(w.Op, na, n, nt * B))
+        permutedims!(reshape(T, na, nt, n, B), w.Op, (1, 3, 2, 4))
+        O .+= T
+    else
+        _batched_gemm!('N', 'N', 1.0, F3, d.KlocalT, 1.0, O3)
+    end
 
     # pitch angle scattering, of the part without the pitch average
     G = reshape(F, na, nt * nB)
     sum!(w.mean, G)
     reshape(T, na, nt * nB) .= G .- w.mean ./ na
     mul!(w.T2, d.Dpitch, T)
-    O .+= d.nuscale .* w.T2
+    if bop.rotating
+        reshape(O, na, nt, nB) .+= reshape(d.nuscale, 1, nt, nB) .* reshape(w.T2, na, nt, nB)
+    else
+        O .+= d.nuscale .* w.T2
+    end
 
     # Rosenbluth potential part, diagonal in Legendre mode
     mul!(reshape(w.Fm, nL, nt * nB), d.Txi_inv, G)
     permutedims!(w.P, w.Fm, (2, 3, 1, 4))
     _batched_gemm!('N', 'N', 1.0, reshape(w.P, nt, n, nL * B), d.KGHT, 0.0, reshape(w.Q, nt, n, nL * B))
+    bop.rotating && (w.Q .*= d.rowdens)   # field particle terms scale with the density of their own species
     permutedims!(w.Gm, w.Q, (3, 1, 2, 4))
     mul!(reshape(O, na, nt * nB), d.Txi, reshape(w.Gm, nL, nt * nB), true, true)
 
@@ -203,6 +258,17 @@ function apply_bordered!(Y::AbstractMatrix, bop::BatchedDKE, X::AbstractMatrix)
         sum!(w.c, d.sw .* view(w.Fm, 1:1, :, :, :))
         _batched_gemm!('N', 'N', 1.0, d.Kexchange, reshape(w.c, n, 1, B), 0.0, w.d)
         reshape(O, na, nt, n, B) .+= d.txi1 .* reshape(w.d, 1, 1, n, B)
+    end
+    # exchange between species in a rotating plasma: A (G m - u) - K0 V m with the moments
+    # m = ⟨M f⟩, u = ⟨M K0 f⟩ of the isotropic part
+    if bop.nk > 0
+        reshape(w.iso, 1, nt, n, B) .= view(w.Fm, 1:1, :, :, :)
+        _batched_gemm!('N', 'N', 1.0, d.XM, w.iso, 0.0, w.xm)
+        _batched_gemm!('N', 'N', 1.0, d.XK, w.iso, 0.0, w.xu)
+        _batched_gemm!('N', 'N', 1.0, d.XG, w.xm, -1.0, w.xu)
+        _batched_gemm!('N', 'N', 1.0, d.XA, w.xu, 0.0, w.dx)
+        _batched_gemm!('N', 'N', -1.0, d.XKV, w.xm, 1.0, w.dx)
+        reshape(O, na, nt, n, B) .+= d.txi1 .* reshape(w.dx, 1, nt, n, B)
     end
     bop.krook != 0 && (O .+= bop.krook .* F)
 
@@ -227,6 +293,13 @@ function _batched_rhs(ops::AbstractVector{<:DKEOperator{Float64}}, EparB::Abstra
     na, nt, nx, ns = bop.dims
     B, N = bop.nbatch, prod(bop.dims)
     op1 = first(ops)
+    if bop.rotating   # the drive of a rotating plasma is not such a sum: formed on the host
+        Rh = zeros(N + 2ns, B)
+        Threads.@threads for b in 1:B
+            Rh[1:N, b] .= vec(dke_rhs(ops[b], EparB[b]))
+        end   # COV_EXCL_LINE (counted, never marked run)
+        return _like(bop.data.scaling, Rh)
+    end
     xi, x = op1.pitchgrid.xi, op1.speedgrid.x
     # drive = c1[x, s] (1 + ξ²) BxgradB/(2B³)[θ] + c2[x, s] ξ B[θ], see dke_rhs and
     # radial_magnetic_drift: -(A1 + x² A2) v_m·∇ρ F_M + A3 B v∥ F_M

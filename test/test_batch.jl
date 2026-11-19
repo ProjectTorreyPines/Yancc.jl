@@ -11,6 +11,19 @@ function batch_cases(; ntheta=11, nalpha=17, nx=4, Erho=(0.0, 0.0, 0.0, 0.0), en
     end for (k, (eps, density, T, aLT)) in enumerate(cases)]
 end
 
+# Shaped surfaces with sonic rotation (helpers of test_rotation.jl): Mach numbers of deuterium
+# from 0 to 1.3 with and without shear, one surface without up-down symmetry.
+function rotating_batch_cases(; ntheta=13, nalpha=17, nx=4, energy_exchange=false, p1="4z", Erho=(0.0, 0.0, 0.0, 0.0))
+    cases = ((0.3, 1.0, 0.0, 0.0, 0.5, -1.0, 2e3), (0.5, 1.6, 0.3, 0.0, 1.3, 0.0, 1e3), (0.6, 1.4, -0.2, 0.15, 0.9, 1.0, 3e3),
+        (0.4, 1.8, 0.4, 0.0, 0.0, 0.0, 2e3))
+    return [begin
+        field = miller_field(; r, a=1.0, R0=3.0, q=1.5 + k / 2, Bunit=2.0, kappa, delta, s_zmag, ipccw=-1, btccw=-1, ntheta)
+        omega = mach_omega(mach; T)
+        DKEOperator(field, UniformPitchAngleGrid(nalpha), MaxwellSpeedGrid(nx), rotating_species(; T, dlnT=(3.0, 2.0 + k / 2, 3.0)), Erho[k];
+            lnlambda=16.0, p1, energy_exchange, rotation=Rotation(omega, shear * omega))
+    end for (k, (r, kappa, delta, s_zmag, mach, shear, T)) in enumerate(cases)]
+end
+
 @testset "batched GMRES" begin
     n, nb = 40, 5
     As = [[1 / (1 + abs(i - j)) + (i == j ? 3.0 + k : 0.0) + 0.3 * sin(i * j * k) for i in 1:n, j in 1:n] for k in 1:nb]
@@ -60,13 +73,13 @@ end
     Alate!(Y, V) = (A!(Y, V); V === X0 && (Y[1, 2] = NaN); Y)
     _, _, residuals, status = Yancc.gmres_batched!(X0, Alate!, copy(B), M!; rtol=1e-12)
     @test status == [:converged, :failed, :converged, :converged, :converged] && isnan(residuals[2])
-    # a preconditioner that changes from call to call: the recurrence converges, the
-    # residual does not
+    # a preconditioner that changes from call to call: the flexible form keeps the
+    # preconditioned basis, so the solution is still the one of the recurrence
     calls = Ref(0)
     Mvar!(Z, V) = (calls[] += 1; M!(Z, V); Z[:, 1] .*= 1 + 0.5 * sin(calls[]); Z)
-    _, _, residuals, status = Yancc.gmres_batched!(zeros(n, nb), A!, copy(B), Mvar!; rtol=1e-12)
-    @test status[1] == :stagnated && residuals[1] > 1e-12
-    @test status[2:5] == fill(:converged, 4)
+    X, _, residuals, status = Yancc.gmres_batched!(zeros(n, nb), A!, copy(B), Mvar!; rtol=1e-12)
+    @test status == [:converged, :converged, :converged, :converged, :converged] && all(<=(1e-12), residuals)
+    @test all(isapprox(X[:, k], As[k] \ B[:, k]; rtol=1e-10, atol=1e-14) for k in 1:nb)
 end
 
 @testset "batched seams on the host" begin
@@ -241,6 +254,10 @@ end
     ops = batch_cases()
     other = batch_cases(; nalpha=19)
     @test_throws ArgumentError solve_dke_tokamak_batch([ops[1], other[2]])
+    # cases with and without a rotation do not share the structure of their collisions
+    rotating = rotating_batch_cases(; ntheta=11, nalpha=17, nx=4)
+    @test_throws ArgumentError solve_dke_tokamak_batch([DKEOperator(rotating[1].field, rotating[1].pitchgrid, rotating[1].speedgrid,
+            rotating[1].species, 0.0; lnlambda=16.0, p1="4z"), rotating[2]])
     @test_throws ArgumentError solve_dke_tokamak_batch(ops; EparB=[0.0, 1.0])
     @test_throws ErrorException solve_dke_tokamak_batch(ops; device=:cuda)
     @test_logs (:warn, r"stopped above") solve_dke_tokamak_batch(ops; rtol=1e-10, maxiter=2)
@@ -251,4 +268,63 @@ end
     Yancc._solve_failed!(again, status, ops, zeros(length(ops)), [2, 4]; rtol=1e-6, restart=80, maxiter=400)
     @test status == [:failed, :converged, :failed, :converged]
     @test all(isapprox(again[k].heat_flux, sols[k].heat_flux; rtol=1e-5) for k in (2, 4))
+end
+
+@testset "batched operator with rotation: exchange = $energy_exchange, Erho = $(Erho[2])" for (energy_exchange, Erho) in
+                                                                                        ((false, (0.0, 0.0, 0.0, 0.0)), (true, (0.0, 0.0, 0.0, 0.0)), (false, (0.0, 800.0, -1500.0, 300.0)))
+    ops = rotating_batch_cases(; energy_exchange, Erho)
+    borders = [Yancc.DKEBorder(op) for op in ops]
+    bop = Yancc.BatchedDKE(ops, Val(:cpu))
+    @test bop.rotating && bop.nk == (energy_exchange ? 0 : 6)
+    M = Yancc.system_size(ops[1])
+    X = reduce(hcat, [test_vector(M) .* (1 + 0.1 * k) .+ 0.01 * k for k in eachindex(ops)])
+    Y = Yancc.apply_bordered!(similar(X), bop, X)
+    EparB = [0.0, 0.02, -0.01, 0.0]
+    rhs = Yancc._batched_rhs(ops, EparB, bop)
+    N = M - 2 * length(ops[1].species)
+    for (k, op) in enumerate(ops)
+        @test Y[:, k] ≈ Yancc.apply_bordered!(zeros(M), op, borders[k], X[:, k]) rtol = 1e-12
+        @test bop.data.scaling[:, k] ≈ Yancc._row_scaling(op, borders[k]) rtol = 1e-13
+        @test rhs[1:N, k] ≈ vec(Yancc.dke_rhs(op, EparB[k])) rtol = 1e-13
+        @test all(iszero, rhs[(N+1):M, k])
+    end
+    # the matrices of the preconditioner are those of the single case code
+    maps = Yancc.PreconditionerMaps(ops[1], 4, bop.has_speed, Val(:cpu))
+    planes, coarse = Yancc._assemble_preconditioner(maps, bop)
+    na, nt, nz, nx, ns = Yancc.state_size(ops[1])
+    close(A, B) = norm(A - B, Inf) <= 1e-12 * norm(B, Inf)
+    for (k, op) in enumerate(ops)
+        @test close(Yancc._matrix(coarse, k), first(Yancc.moment_coarse_matrix(op, borders[k], 4)))
+        @test all(close(Yancc._matrix(planes, i + nx * (s - 1) + nx * ns * (k - 1)), Yancc.plane_matrix(op, i, s)) for s in 1:ns, i in 1:nx)
+    end
+    @test Yancc._matrix(coarse.m, coarse.rowptr, coarse.colval, ones(length(coarse.colval))) ==
+          (x -> (x.nzval .= 1; x))(first(Yancc.moment_coarse_matrix(ops[1], borders[1], 4; uniform=true, speed=bop.has_speed)))
+end
+
+@testset "batched solve with rotation: exchange = $energy_exchange" for energy_exchange in (false, true)
+    ops = rotating_batch_cases(; energy_exchange)
+    EparB = [0.0, 0.02, -0.01, 0.0]
+    sols = solve_dke_tokamak_batch(ops; EparB, rtol=1e-10)
+    for (k, op) in enumerate(ops)
+        ref = solve_dke_tokamak(op; EparB=EparB[k], rtol=1e-10)
+        @test sols[k].residual < 1e-10
+        @test abs(sols[k].iterations - ref.iterations) <= 2
+        for f in (:particle_flux, :heat_flux, :VparB)
+            @test getfield(sols[k], f) ≈ getfield(ref, f) rtol = 1e-7
+        end
+        # (no flux of momentum in the case without rotation: compared on the scale of the others)
+        for f in (:momentum_flux, :angular_momentum_flux)
+            @test getfield(sols[k], f) ≈ getfield(ref, f) rtol = 1e-7 atol = 1e-7 * maximum(abs, getfield(sols[2], f))
+        end
+        @test sols[k].JparB ≈ ref.JparB rtol = 1e-7
+        @test relerr(sols[k].f1, ref.f1) < 1e-7
+    end
+    pieces = solve_dke_tokamak_batch(ops; EparB, rtol=1e-10, batchsize=3)
+    @test all(pieces[k].heat_flux ≈ sols[k].heat_flux for k in eachindex(ops))
+    # the solvers of a GPU: dense blocks for the coarse and the plane matrices
+    blocks, status, _ = Yancc._solve_dke_tokamak_batch(ops; EparB, rtol=1e-10, coarse_solver=:block, plane_solver=:block)
+    @test all(==(:converged), status)
+    @test all(blocks[k].iterations <= sols[k].iterations + 2 && isapprox(blocks[k].heat_flux, sols[k].heat_flux; rtol=1e-7) for k in eachindex(ops))
+    layout = Yancc._coarse_block_layout(ops[1], 4)
+    @test layout.sb * layout.K + layout.nbd == 4 * 13 * 12 + (energy_exchange ? 0 : 12) + 6
 end

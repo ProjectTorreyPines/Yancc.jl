@@ -48,7 +48,7 @@ end
 function _coarse_block_layout(op::DKEOperator, nl::Integer)
     _, nt, _, nx, ns = state_size(op)
     reach = _stencil_reach(op.trajectories.Dt, nt; periodic=true)
-    return _chain_layout(reach, nt, nl * nx * ns, nx * ns + 2ns; periodic=true)
+    return _chain_layout(reach, nt, nl * nx * ns, _coarse_aux(op) + 2ns; periodic=true)
 end
 
 """
