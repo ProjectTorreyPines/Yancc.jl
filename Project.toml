@@ -19,7 +19,7 @@ YanccForwardDiffExt = "ForwardDiff"
 
 [compat]
 CUDA = "6"
-CUDSS = "0.8"
+CUDSS = "0.8, 1"
 ForwardDiff = "0.10, 1"
 LinearAlgebra = "1"
 NPZ = "0.4"
